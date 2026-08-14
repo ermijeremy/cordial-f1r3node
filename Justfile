@@ -46,6 +46,13 @@ ci:
     just test
     just check-core-boundaries
 
+lean-build:
+    cd lean && lake build
+
+lean-check-sorry:
+    cd lean && lake build 2>&1 | tee /tmp/lean-build.log
+    ! grep -q "declaration uses 'sorry'" /tmp/lean-build.log
+
 demo-cordial-env:
     cp -n docker/.env.example {{docker_env}}
 
