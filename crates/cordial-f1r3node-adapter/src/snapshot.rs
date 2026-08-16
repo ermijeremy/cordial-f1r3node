@@ -78,9 +78,8 @@ use std::collections::{HashMap, HashSet};
 
 use cordial_miners_core::blocklace::Blocklace;
 use cordial_miners_core::consensus::{
-    OrderingCache, collect_validator_tips, compute_all_depths, fork_choice,
-    last_round_of_wave, latest_weighted_final_leader, wave_of_round, weighted_tau_with_cache,
-    xsort,
+    OrderingCache, collect_validator_tips, compute_all_depths, fork_choice, last_round_of_wave,
+    latest_weighted_final_leader, wave_of_round, weighted_tau_with_cache, xsort,
 };
 use cordial_miners_core::execution::{CordialBlockPayload, compute_deploys_in_scope};
 use cordial_miners_core::types::{BlockIdentity, NodeId};
