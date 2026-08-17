@@ -1,0 +1,38 @@
+name: Lean
+
+on:
+  push:
+    branches: ["lean-q1"]
+    paths: ["lean/**"]
+  pull_request:
+    branches: ["lean-q1", "dev", "master"]
+    paths: ["lean/**"]
+    types: [opened, synchronize, reopened]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Mathlib build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.elan
+            lean/.lake
+          key: lean-${{ hashFiles('lean/lean-toolchain', 'lean/lake-manifest.json') }}
+
+      - name: Build
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: lean
+          build-args: "--log-level=info"
+
+      - name: Fail on sorry
+        working-directory: lean
+        run: |
+          lake build 2>&1 | tee build.log
+          ! grep -q "declaration uses 'sorry'" build.log
