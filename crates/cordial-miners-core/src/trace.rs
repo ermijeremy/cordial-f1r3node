@@ -164,3 +164,160 @@ pub struct WaveTaskEvent {
     /// `"propose"` | `"vote"` | `"finalize"`
     pub task: String,
 }
+
+// Emission helpers: the public API used by consensus modules
+
+/// Serialize `event` to JSON and append it to `CORDIAL_TRACE_FILE` (or stderr).
+/// Write errors are silently ignored so a broken sink never aborts the node.
+#[cfg(feature = "trace")]
+pub fn emit(event: TraceEvent) {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let line = match serde_json::to_string(&event) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    if let Ok(path) = std::env::var("CORDIAL_TRACE_FILE") {
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(file, "{}", line);
+        }
+    } else {
+        eprintln!("[TRACE] {}", line);
+    }
+}
+
+/// No-op stub compiled when the `trace` feature is disabled.
+#[cfg(not(feature = "trace"))]
+#[inline(always)]
+pub fn emit(_event: TraceEvent) {}
+
+// Helpers
+
+/// Hex-encode a byte slice into a lowercase hex string.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Blake2b-256 fingerprint of a bond table (sorted for determinism).
+pub fn weight_table_hash(bonds: &std::collections::HashMap<crate::types::NodeId, u64>) -> String {
+    use blake2::{Blake2b, Digest, digest::consts::U32};
+
+    let mut entries: Vec<_> = bonds.iter().collect();
+    entries.sort_by_key(|(node, _)| node.0.as_slice());
+
+    let mut h = Blake2b::<U32>::new();
+    for (node, weight) in entries {
+        h.update(&(node.0.len() as u64).to_le_bytes());
+        h.update(&node.0);
+        h.update(&weight.to_le_bytes());
+    }
+    hex(&h.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every variant must round-trip through JSON with the `"event"` tag intact.
+    #[test]
+    fn all_variants_serialize_with_event_tag() {
+        let events: Vec<TraceEvent> = vec![
+            TraceEvent::CreateBlock(BlockLifecycleEvent {
+                node_id: "v1".into(), wave: Some(0), round: 0,
+                block_hash: "aabb".into(), parent_hashes: vec![],
+                creator: "deadbeef".into(), weight_table_hash: None,
+            }),
+            TraceEvent::ValidateBlock(ValidateBlockEvent {
+                node_id: "v1".into(), wave: Some(0), round: 0,
+                block_hash: "aabb".into(), parent_hashes: vec![],
+                creator: "deadbeef".into(), weight_table_hash: None,
+                outcome: "valid".into(), errors: vec![],
+            }),
+            TraceEvent::InsertBlock(BlockLifecycleEvent {
+                node_id: "v1".into(), wave: Some(0), round: 0,
+                block_hash: "aabb".into(), parent_hashes: vec![],
+                creator: "deadbeef".into(), weight_table_hash: None,
+            }),
+            TraceEvent::BufferBlock(BlockLifecycleEvent {
+                node_id: "v1".into(), wave: None, round: 1,
+                block_hash: "ccdd".into(), parent_hashes: vec!["aabb".into()],
+                creator: "deadbeef".into(), weight_table_hash: None,
+            }),
+            TraceEvent::ResolveMissingParent(ResolveMissingParentEvent {
+                node_id: "v1".into(), block_hash: "ccdd".into(),
+                resolved_parent_hash: "aabb".into(),
+            }),
+            TraceEvent::DetectEquivocation(DetectEquivocationEvent {
+                node_id: "v2".into(), equivocator: "deadbeef".into(), round: 0,
+                conflicting_block_hashes: vec!["aabb".into(), "1122".into()],
+            }),
+            TraceEvent::AcceptApproval(AcceptApprovalEvent {
+                node_id: "v2".into(), wave: Some(1),
+                approver_hash: "ccdd".into(), target_hash: "aabb".into(),
+            }),
+            TraceEvent::BuildThresholdCertificate(ThresholdCertificateEvent {
+                node_id: "v1".into(), wave: 1, leader_hash: "aabb".into(),
+                certificate_id: "cert01".into(), approver_count: 3,
+                approver_weight: Some(300u64),
+            }),
+            TraceEvent::ComputeFinality(ComputeFinalityEvent {
+                node_id: "v1".into(), wave: 1, block_hash: "aabb".into(),
+                decision: "finalized".into(), certificate_id: Some("cert01".into()),
+                output_prefix_hash: Some("ffee".into()),
+            }),
+            TraceEvent::RunTauOrder(TauOrderEvent {
+                node_id: "v1".into(), wave: 1,
+                latest_leader_hash: "aabb".into(), output_len: 5,
+            }),
+            TraceEvent::EmitOutput(EmitOutputEvent {
+                node_id: "v1".into(), wave: 1, block_hash: "aabb".into(),
+                output_index: 0, output_prefix_hash: "ffee".into(),
+            }),
+            TraceEvent::SendPackage(PackageEvent {
+                node_id: "v1".into(), peer_id: "v2".into(),
+                block_hashes: vec!["aabb".into()],
+            }),
+            TraceEvent::DeliverPackage(PackageEvent {
+                node_id: "v2".into(), peer_id: "v1".into(),
+                block_hashes: vec!["aabb".into()],
+            }),
+            TraceEvent::SchedulerTick(SchedulerTickEvent {
+                node_id: "v1".into(), timestamp_ms: 1_000_000, wave: Some(1),
+            }),
+            TraceEvent::RunWaveTask(WaveTaskEvent {
+                node_id: "v1".into(), wave: 1, task: "propose".into(),
+            }),
+        ];
+
+        for event in events {
+            let json = serde_json::to_string(&event).expect("serialize failed");
+            assert!(json.contains(r#""event""#), "Missing 'event' tag in: {}", json);
+            let _: TraceEvent = serde_json::from_str(&json).expect("deserialize failed");
+        }
+    }
+
+    #[test]
+    fn hex_produces_lowercase_even_length_string() {
+        let h = hex(&[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(h, "deadbeef");
+        assert_eq!(h.len(), 8);
+    }
+
+    #[test]
+    fn weight_table_hash_is_deterministic() {
+        use crate::types::NodeId;
+        use std::collections::HashMap;
+
+        let mut bonds: HashMap<NodeId, u64> = HashMap::new();
+        bonds.insert(NodeId(vec![1]), 100);
+        bonds.insert(NodeId(vec![2]), 200);
+        bonds.insert(NodeId(vec![3]), 300);
+
+        let h1 = weight_table_hash(&bonds);
+        let h2 = weight_table_hash(&bonds);
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64);
+    }
+}
