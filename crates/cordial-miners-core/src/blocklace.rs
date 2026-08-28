@@ -2,6 +2,10 @@ use crate::block::Block;
 use crate::crypto::CryptoVerifier;
 use crate::types::{BlockContent, BlockIdentity, NodeId};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+#[cfg(feature = "trace")]
+use crate::trace::{self, BlockLifecycleEvent, TraceEvent};
+#[cfg(feature = "trace")]
+use crate::consensus::round::depth;
 
 // The blocklace B - a set of blocks satisfying the closure and axioms
 // From definition 2.3, A blocklace B is a set of blocks subject to some invariants.
@@ -156,16 +160,68 @@ impl Blocklace {
             .map_err(|e| format!("Invalid signature: {e:?}"))?;
 
         // 2. Closure Axiom Enforcement (Issue 1)
-        for pred_id in &block.content.predecessors {
-            if !self.blocks.contains_key(pred_id) {
-                return Err(format!(
-                    "Closure violation: predecessor {pred_id:?} not in blocklace"
-                ));
+        let missing: Vec<&BlockIdentity> = block
+            .content
+            .predecessors
+            .iter()
+            .filter(|pred_id| !self.blocks.contains_key(*pred_id))
+            .collect();
+
+        if !missing.is_empty() {
+            #[cfg(feature = "trace")]
+            {
+                let round = depth(self, &block.identity).unwrap_or(0);
+                trace::emit(TraceEvent::BufferBlock(BlockLifecycleEvent {
+                    node_id: trace::hex(&block.identity.creator.0),
+                    wave: None,
+                    round,
+                    block_hash: trace::hex(&block.identity.content_hash),
+                    parent_hashes: block
+                        .content
+                        .predecessors
+                        .iter()
+                        .map(|p| trace::hex(&p.content_hash))
+                        .collect(),
+                    creator: trace::hex(&block.identity.creator.0),
+                    weight_table_hash: None,
+                }));
             }
+            return Err(format!(
+                "Closure violation: predecessor {:?} not in blocklace",
+                missing[0]
+            ));
         }
 
         // 3. Commit to state
+        #[cfg(feature = "trace")]
+        let (block_hash_hex, creator_hex, parent_hashes_hex) = {
+            let bh = trace::hex(&block.identity.content_hash);
+            let cr = trace::hex(&block.identity.creator.0);
+            let ph: Vec<String> = block
+                .content
+                .predecessors
+                .iter()
+                .map(|p| trace::hex(&p.content_hash))
+                .collect();
+            (bh, cr, ph)
+        };
+
         self.commit_validated(block.identity.clone(), block.content);
+
+        #[cfg(feature = "trace")]
+        {
+            let round = depth(self, &block.identity).unwrap_or(0);
+            trace::emit(TraceEvent::InsertBlock(BlockLifecycleEvent {
+                node_id: creator_hex.clone(),
+                wave: None,
+                round,
+                block_hash: block_hash_hex,
+                parent_hashes: parent_hashes_hex,
+                creator: creator_hex,
+                weight_table_hash: None,
+            }));
+        }
+
         Ok(())
     }
     // pub fn insert(&mut self, block: Block) -> Result<(), String> {
