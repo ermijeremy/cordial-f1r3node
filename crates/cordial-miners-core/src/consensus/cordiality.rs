@@ -20,6 +20,8 @@ use crate::blocklace::Blocklace;
 use crate::consensus::approval::{ApprovalMemo, approves, weighted_approving_creators_with_memo};
 use crate::consensus::round::{blocks_at_depth, depth};
 use crate::types::{BlockIdentity, NodeId};
+#[cfg(feature = "trace")]
+use crate::trace::{self, DetectEquivocationEvent, TraceEvent};
 
 /// A same-round equivocation detected in the blocklace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +100,21 @@ pub fn all_equivocations(blocklace: &Blocklace) -> Vec<Equivocation> {
 
             if blocks.len() >= 2 {
                 blocks.sort();
+
+                #[cfg(feature = "trace")]
+                trace::emit(TraceEvent::DetectEquivocation(DetectEquivocationEvent {
+                    // "node_id" here is the observer (the local node that
+                    // detected it). We use the equivocator's id as a proxy
+                    // since we have no local-node context at this call site.
+                    node_id: trace::hex(&creator.0),
+                    equivocator: trace::hex(&creator.0),
+                    round,
+                    conflicting_block_hashes: blocks
+                        .iter()
+                        .map(|id| trace::hex(&id.content_hash))
+                        .collect(),
+                }));
+
                 equivocations.push(Equivocation {
                     creator: creator.clone(),
                     round,

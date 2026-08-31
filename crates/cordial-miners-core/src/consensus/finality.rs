@@ -7,6 +7,8 @@ use crate::consensus::cordiality::{super_ratifies, weighted_super_ratifies};
 use crate::consensus::round::{blocks_at_depth, compute_all_depths, depth};
 use crate::consensus::wave::{last_round_of_wave, leader_blocks_of_wave, wave_of_round};
 use crate::types::{BlockIdentity, NodeId};
+#[cfg(feature = "trace")]
+use crate::trace::{self, ComputeFinalityEvent, TraceEvent};
 
 type RoundIndex = HashMap<u64, Vec<Block>>;
 
@@ -99,7 +101,19 @@ where
         .flat_map(|round| blocks_at_depth(blocklace, round))
         .collect();
 
-    super_ratifies(blocklace, &witness_blocks, &candidate_block, n, f)
+    let result = super_ratifies(blocklace, &witness_blocks, &candidate_block, n, f);
+
+    #[cfg(feature = "trace")]
+    trace::emit(TraceEvent::ComputeFinality(ComputeFinalityEvent {
+        node_id: trace::hex(&candidate.creator.0),
+        wave,
+        block_hash: trace::hex(&candidate.content_hash),
+        decision: if result { "finalized".into() } else { "not_finalized".into() },
+        certificate_id: None,
+        output_prefix_hash: None,
+    }));
+
+    result
 }
 
 /// Return the final leader block for a wave, if one exists.

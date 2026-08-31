@@ -13,6 +13,8 @@ use crate::consensus::finality::{
 use crate::consensus::round::depth;
 use crate::consensus::wave::wave_of_round;
 use crate::types::{BlockIdentity, NodeId};
+#[cfg(feature = "trace")]
+use crate::trace::{self, EmitOutputEvent, TauOrderEvent, TraceEvent};
 
 #[derive(Debug, Clone, Default)]
 pub struct OrderingCache {
@@ -443,6 +445,37 @@ where
         ordered: Vec::new(),
     };
     tau_from_leader(blocklace, &latest_leader, &config, &mut state)?;
+
+    #[cfg(feature = "trace")]
+    {
+        let wave = depth(blocklace, &latest_leader)
+            .and_then(|r| wave_of_round(r, wavelength))
+            .unwrap_or(0);
+
+        trace::emit(TraceEvent::RunTauOrder(TauOrderEvent {
+            node_id: trace::hex(&latest_leader.creator.0),
+            wave,
+            latest_leader_hash: trace::hex(&latest_leader.content_hash),
+            output_len: state.ordered.len(),
+        }));
+
+        // Emit one EmitOutput per block, with a running prefix hash.
+        let mut prefix_bytes: Vec<u8> = Vec::new();
+        for (idx, id) in state.ordered.iter().enumerate() {
+            prefix_bytes.extend_from_slice(&id.content_hash);
+            use blake2::{Blake2b, Digest, digest::consts::U32};
+            let prefix_hash = trace::hex(&Blake2b::<U32>::digest(&prefix_bytes));
+
+            trace::emit(TraceEvent::EmitOutput(EmitOutputEvent {
+                node_id: trace::hex(&id.creator.0),
+                wave,
+                block_hash: trace::hex(&id.content_hash),
+                output_index: idx,
+                output_prefix_hash: prefix_hash,
+            }));
+        }
+    }
+
     Ok(state.ordered)
 }
 
