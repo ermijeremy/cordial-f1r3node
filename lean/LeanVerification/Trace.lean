@@ -166,6 +166,24 @@ inductive TraceEvent where
   | runWaveTask : RunWaveTaskEvent → TraceEvent
   deriving Repr, DecidableEq
 
+/-- Stable canonical event name used in first-mismatch diagnostics. -/
+def TraceEvent.kind : TraceEvent → String
+  | .createBlock _ => "create_block"
+  | .validateBlock _ => "validate_block"
+  | .insertBlock _ => "insert_block"
+  | .bufferBlock _ => "buffer_block"
+  | .resolveMissingParent _ => "resolve_missing_parent"
+  | .detectEquivocation _ => "detect_equivocation"
+  | .acceptApproval _ => "accept_approval"
+  | .buildThresholdCertificate _ => "build_threshold_certificate"
+  | .computeFinality _ => "compute_finality"
+  | .runTauOrder _ => "run_tau_order"
+  | .emitOutput _ => "emit_output"
+  | .sendPackage _ => "send_package"
+  | .deliverPackage _ => "deliver_package"
+  | .schedulerTick _ => "scheduler_tick"
+  | .runWaveTask _ => "run_wave_task"
+
 private def requireOnlyKeys (json : Json) (allowed : List String) : Except String Unit := do
   let object ← json.getObj?
   match object.toList.find? (fun field => !allowed.contains field.1) with
@@ -303,17 +321,22 @@ def parseLine (line : String) : Except String TraceEvent := do
   let json ← Json.parse line
   parseEventJson json
 
-/-- Read canonical newline-delimited JSON. Empty lines are allowed; every
-non-empty line must be one valid, known event. The first error includes its
-one-based line number. -/
+/-- Read canonical newline-delimited JSON. A final line terminator is allowed,
+but an empty record in the middle of a trace is an error rather than a silently
+discarded event. Every record must be one valid, known event, and the first
+error includes its one-based line number. -/
 def readTraceFile (path : String) : IO (Except String (List TraceEvent)) := do
   let content ← IO.FS.readFile path
   let rec go (lineNo : Nat) (lines : List String) (events : List TraceEvent) :=
     match lines with
     | [] => .ok events.reverse
+    | [line] =>
+        if line.isEmpty then .ok events.reverse
+        else match parseLine line with
+          | .ok event => .ok (event :: events).reverse
+          | .error reason => .error s!"line {lineNo}: {reason}"
     | line :: rest =>
-        if line.isEmpty then
-          go (lineNo + 1) rest events
+        if line.isEmpty then .error s!"line {lineNo}: empty trace record"
         else
           match parseLine line with
           | .ok event => go (lineNo + 1) rest (event :: events)

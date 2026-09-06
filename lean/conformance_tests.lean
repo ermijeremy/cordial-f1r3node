@@ -59,10 +59,15 @@ private def parserTests (base : String) : IO Bool := do
     "{\"event\":\"scheduler_tick\",\"node_id\":\"n\",\"tick\":\"one\",\"wave\":null}")
   let extra := isError (parseLine
     "{\"event\":\"scheduler_tick\",\"node_id\":\"n\",\"tick\":1,\"wave\":null,\"extra\":0}")
-  let ok := coverageOk && malformed && unknown && missing && wrongType && extra
+  let escaped := match parseLine
+      "{\"event\":\"scheduler_tick\",\"node_id\":\"quoted\\\"node\",\"tick\":1,\"wave\":null}" with
+    | .ok (.schedulerTick event) => event.nodeId == "quoted\"node"
+    | _ => false
+  let blank := isError (parseLine "")
+  let ok := coverageOk && malformed && unknown && missing && wrongType && extra && escaped && blank
   IO.println s!"[parser/all-15-and-errors] {if ok then "PASS ✓" else "FAIL"}"
   if !ok then
-    IO.println s!"  coverage={coverageOk}, malformed={malformed}, unknown={unknown}, missing={missing}, wrongType={wrongType}, extra={extra}, schema={reprStr schema}"
+    IO.println s!"  coverage={coverageOk}, malformed={malformed}, unknown={unknown}, missing={missing}, wrongType={wrongType}, extra={extra}, escaped={escaped}, blank={blank}, schema={reprStr schema}"
   pure ok
 
 private def negativeTests (base : String) : IO Bool := do
@@ -103,9 +108,10 @@ private def negativeTests (base : String) : IO Bool := do
       | .computeFinality event => some (.computeFinality
           { event with weightTableHash := "wrong-weights" })
       | _ => none
-    -- This is the executable mutation oracle: it models Rust weakening its
-    -- threshold and claiming finality in the count-only low-stake scenario.
-    let weakenedThreshold := mustReplace lowEvents fun
+    -- A separate semantic negative case: a false finalized claim over the
+    -- low-stake execution. The actual compiled Rust threshold mutation is
+    -- exercised by scripts/issue188_mutation_test.sh.
+    let lowStakeFalseFinality := mustReplace lowEvents fun
       | .computeFinality event => some (.computeFinality
           { event with decision := "finalized", certificateId := some "mutated" })
       | _ => none
@@ -118,7 +124,7 @@ private def negativeTests (base : String) : IO Bool := do
       expectFailure "incorrect-tau" "tau order mismatch" normalConfig incorrectTau,
       expectFailure "incorrect-output-prefix" "output prefix hash mismatch" normalConfig incorrectOutput,
       expectFailure "wrong-weight-table" "weight table hash mismatch" normalConfig wrongWeightHash,
-      expectFailure "weakened-threshold-mutation" "finality mismatch" lowConfig weakenedThreshold
+      expectFailure "low-stake-false-finality" "finality mismatch" lowConfig lowStakeFalseFinality
     ].mapM id
     pure (checks.all id)
   | .error reason, _, _ | _, .error reason, _ | _, _, .error reason =>

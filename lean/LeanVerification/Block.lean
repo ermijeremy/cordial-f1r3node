@@ -7,11 +7,11 @@ Mirrors the Rust types:
   - `BlockContent`  → `BlockContent`  (types/content_id.rs)
   - `Block`         → `Block`         (block.rs)
 
-The cryptographic hash is abstracted by an executable injective encoding for
-the standalone formal examples.  Trace replay uses a compact injective
-interning table from Rust hash strings to `BlockId`; recursively encoding a
-whole predecessor DAG into a natural number is mathematically convenient but
-not an executable representation of a fixed-width cryptographic digest.
+The cryptographic hash is abstracted by an executable injective encoding.
+Trace replay constructs formal content from the checked creator/predecessor
+graph and a compact opaque payload tag, then records a separate one-to-one
+association between the resulting `BlockId` and the concrete Rust digest. It
+does not claim this natural-number encoding is the fixed-width Rust hash.
 
 Owned by Issue 02 (KR1 — Blocklace Core).
 -/
@@ -41,18 +41,27 @@ abbrev BlockId := Nat
 is the set `P` of predecessor block identities.
 -/
 structure BlockContent where
-  payload      : List Nat
+  payload      : List UInt8
   predecessors : Finset BlockId
   deriving DecidableEq
 
-private def blockContentEquiv : BlockContent ≃ List Nat × Finset BlockId where
+private def uint8Equiv : UInt8 ≃ Fin 256 where
+  toFun value := ⟨value.toNat, value.toNat_lt⟩
+  invFun value := UInt8.ofNat value.val
+  left_inv value := UInt8.toNat_inj.mp (by simp)
+  right_inv value := Fin.ext (by simp)
+
+private instance : Encodable UInt8 :=
+  Encodable.ofEquiv (Fin 256) uint8Equiv
+
+private def blockContentEquiv : BlockContent ≃ List UInt8 × Finset BlockId where
   toFun content := (content.payload, content.predecessors)
   invFun data := { payload := data.1, predecessors := data.2 }
   left_inv _ := rfl
   right_inv _ := rfl
 
 instance : Encodable BlockContent :=
-  Encodable.ofEquiv (List Nat × Finset BlockId) blockContentEquiv
+  Encodable.ofEquiv (List UInt8 × Finset BlockId) blockContentEquiv
 
 /-! ### Block Identity / Hash -/
 
@@ -79,22 +88,16 @@ theorem hashInj {n1 n2 : NodeId} {c1 c2 : BlockContent}
 /--
 A single blocklace block.
 
-`id` is opaque at the protocol-model layer.  Standalone examples may choose
-`hashContent creator content`; replay instead interns the externally verified
-Rust digest and rejects duplicate digest declarations.  The correspondence
-between a concrete digest and signed Rust content is therefore an explicit
-adapter/cryptography trust boundary, not an enormous recursively encoded Nat.
+Every formal block identifier is the executable injective encoding of its
+creator and content. The trace adapter separately retains the concrete Rust
+digest and rejects duplicate digest declarations; the trace intentionally does
+not expose enough bytes to reproduce Rust's cryptographic digest itself.
 -/
 structure Block where
   id        : BlockId
   creator   : NodeId
   content   : BlockContent
+  id_eq     : id = hashContent creator content
   deriving DecidableEq
-
-/-- Optional model-side condition for clients that construct identifiers with
-`hashContent`.  The DAG safety development itself needs only fresh opaque IDs,
-which is exactly the abstraction used for real cryptographic hashes. -/
-def HashFaithful (block : Block) : Prop :=
-  block.id = hashContent block.creator block.content
 
 end CordialMiners

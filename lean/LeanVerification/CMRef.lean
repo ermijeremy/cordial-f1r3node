@@ -7,11 +7,36 @@ KR2, and KR4 definitions used by the safety proofs.
 -/
 
 import LeanVerification.Finality
+import LeanVerification.WCert
 
 namespace CordialMiners.CMRef
 
 open CordialMiners
 open scoped BigOperators
+
+/-! ### Executable KR3 certificate accumulator -/
+
+/-- Fold the proved KR3 `WCert.accept` operation over reported validators.
+Repeated validators are deduplicated by `WCert.accept`, so the resulting
+running weight cannot be inflated by duplicate certificate members. -/
+def buildWCert (bonds : NodeId → ℕ) (members : List NodeId) : WCert NodeId :=
+  members.foldl (WCert.accept bonds) WCert.empty
+
+/-- The executable certificate accumulator's cached weight is exactly the
+weight of its accepted validator set. -/
+theorem buildWCert_invariant (bonds : NodeId → ℕ) (members : List NodeId) :
+    (buildWCert bonds members).Invariant bonds := by
+  unfold buildWCert
+  have preserve : ∀ (certificate : WCert NodeId), certificate.Invariant bonds →
+      (members.foldl (WCert.accept bonds) certificate).Invariant bonds := by
+    intro certificate hCertificate
+    induction members generalizing certificate with
+    | nil => simpa
+    | cons member tail ih =>
+        simp only [List.foldl_cons]
+        exact ih (WCert.accept bonds certificate member)
+          (WCert.accept_invariant bonds certificate member hCertificate)
+  exact preserve WCert.empty (WCert.empty_invariant bonds)
 
 /-- Executable observation membership. -/
 def checkObserves (B : Blocklace) (hV : ValidBlocklace B) (a b : BlockId) : Bool :=

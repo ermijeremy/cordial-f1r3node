@@ -182,12 +182,15 @@ private def insertBlock (config : ReplayConfig) (dag : ReplayDag)
   let reportedRound ← match event.round with
     | some round => pure round
     | none => throw s!"inserted block {event.blockHash} has null round"
+  let opaqueTag := toString dag.blocks.length
   let content : BlockContent :=
-    -- The trace schema intentionally does not expose payload bytes.  A compact
-    -- fresh tag represents the opaque payload/hash identity in the formal DAG.
-    { payload := [dag.blocks.length], predecessors := parents.toFinset }
+    -- The trace omits application payload bytes. Use an injective, compact
+    -- insertion tag as the opaque payload abstraction. `ReplayedBlock` keeps
+    -- the checked bijection to the real Rust digest separately.
+    { payload := opaqueTag.toList.map (fun char => UInt8.ofNat char.toNat),
+      predecessors := parents.toFinset }
   let block : Block :=
-    { id := dag.blocks.length, creator := creator, content := content }
+    { id := hashContent creator content, creator := creator, content := content, id_eq := rfl }
   if hParents : content.predecessors ⊆ dag.blocklace.keys then
     if hNew : block.id ∉ dag.blocklace.keys then
       let blocklace' := blocklaceInsert dag.blocklace block
@@ -215,15 +218,18 @@ structure ReplayState where
   certificates : List BuildThresholdCertificateEvent
   buffered : List (String × List String)
   equivocationChecks : Nat
+  finalityChecks : Nat
   finalityDecisions : List Bool
   tauChecks : Nat
+  outputChecks : Nat
   lastTau : Option (Nat × List String)
   emitted : List String
 
 def ReplayState.empty (config : ReplayConfig) : ReplayState :=
   { config, dag := ReplayDag.empty, approvals := [], checkedApprovalPairs := [],
     certificates := [], buffered := [], equivocationChecks := 0,
-    finalityDecisions := [], tauChecks := 0, lastTau := none, emitted := [] }
+    finalityChecks := 0, finalityDecisions := [], tauChecks := 0,
+    outputChecks := 0, lastTau := none, emitted := [] }
 
 private def requireKnownBlock (state : ReplayState) (hash : String) : Except String ReplayedBlock :=
   match state.dag.findHash? hash with
@@ -269,12 +275,6 @@ private def sameStringSet (left right : List String) : Bool :=
   left.all (fun value => right.contains value) &&
   right.all (fun value => left.contains value) && uniqueStrings left && uniqueStrings right
 
-private def sumNodeWeights (config : ReplayConfig) (nodes : List String) : Except String Nat := do
-  let ids ← nodes.mapM fun node => match config.nodeIndex? node with
-    | some id => pure id
-    | none => throw s!"certificate names unknown validator '{node}'"
-  pure <| ids.foldl (fun total id => total + config.bonds id) 0
-
 private def checkApprovalEvent (state : ReplayState) (event : AcceptApprovalEvent) : Except String Unit := do
   let approver ← requireKnownBlock state event.approverHash
   let target ← requireKnownBlock state event.targetHash
@@ -298,14 +298,18 @@ private def checkCertificateEvent (state : ReplayState)
   if !uniqueStrings event.approverHashes then throw "certificate repeats an evidence block"
   if event.approverCount != event.approvers.length then
     throw s!"certificate approver_count={event.approverCount}, unique approvers={event.approvers.length}"
-  let support ← sumNodeWeights state.config event.approvers
+  let approverIds ← event.approvers.mapM fun node => match state.config.nodeIndex? node with
+    | some id => pure id
+    | none => throw s!"certificate names unknown validator '{node}'"
+  let referenceCertificate := CMRef.buildWCert state.config.bonds approverIds
+  let support := referenceCertificate.weight
   let total := bondOf state.config.bonds state.config.validatorSet
   if support != event.approverWeight then
     throw s!"certificate weight mismatch: Rust={event.approverWeight}, Lean={support}"
   if total != event.totalWeight then
     throw s!"certificate total mismatch: Rust={event.totalWeight}, Lean={total}"
   if !CMRef.checkStrictTwoThirds state.config.bonds state.config.validatorSet
-      ((event.approvers.filterMap state.config.nodeIndex?).toFinset) then
+      referenceCertificate.accepted then
     throw s!"insufficient quorum: support={support}, total={total}, required 3*support > 2*total"
   let expectedId := computeCertificateId event.kind event.leaderHash event.ratifierHash
   if expectedId != event.certificateId then
@@ -444,7 +448,10 @@ private def checkEvent (state : ReplayState) (event : TraceEvent) : Except Strin
   | .acceptApproval event =>
       let pair := (event.approverHash, event.targetHash)
       let alreadyChecked := state.checkedApprovalPairs.contains pair
-      if !alreadyChecked then
+      if alreadyChecked then
+        if !(state.approvals.contains event) then
+          throw s!"repeated approval {event.approverHash} → {event.targetHash} has inconsistent metadata"
+      else
         checkApprovalEvent state event
       let approvals := state.approvals ++ [event]
       let checkedApprovalPairs :=
@@ -458,6 +465,10 @@ private def checkEvent (state : ReplayState) (event : TraceEvent) : Except Strin
       if event.wavelength != state.config.wavelength then
         throw s!"wavelength mismatch: Rust={event.wavelength}, config={state.config.wavelength}"
       let candidate ← requireKnownBlock state event.blockHash
+      if event.nodeId != candidate.creator then
+        throw s!"finality node mismatch: Rust={event.nodeId}, creator={candidate.creator}"
+      if event.outputPrefixHash.isSome then
+        throw "compute_finality output_prefix_hash must be null before tau/output execution"
       let leanFinal := CMRef.checkFinal state.config.bonds state.config.validatorSet
         state.dag.blocklace state.dag.valid event.wave event.wavelength
         state.config.leader candidate.formalId
@@ -484,7 +495,9 @@ private def checkEvent (state : ReplayState) (event : TraceEvent) : Except Strin
           throw s!"finality references missing super-ratification certificate {certificateId}"
       else if event.certificateId.isSome then
         throw "not_finalized decision has a non-null certificate_id"
-      pure { state with finalityDecisions := state.finalityDecisions ++ [rustFinal] }
+      pure { state with
+        finalityChecks := state.finalityChecks + 1
+        finalityDecisions := state.finalityDecisions ++ [rustFinal] }
   | .runTauOrder event =>
       if event.wavelength != state.config.wavelength then throw "tau wavelength mismatch"
       let (latest, leanOrder) ← computeTau state event.wave
@@ -516,7 +529,7 @@ private def checkEvent (state : ReplayState) (event : TraceEvent) : Except Strin
       let expectedPrefixHash := computeOutputPrefixHash outputPrefix
       if expectedPrefixHash != event.outputPrefixHash then
         throw s!"output prefix hash mismatch at {event.outputIndex}: Rust={event.outputPrefixHash}, Lean={expectedPrefixHash}"
-      pure { state with emitted := outputPrefix }
+      pure { state with emitted := outputPrefix, outputChecks := state.outputChecks + 1 }
   | .sendPackage event =>
       if event.blockHashes.isEmpty then throw "send_package has no blocks"
       pure state
@@ -543,7 +556,7 @@ def replayEvents (config : ReplayConfig) (events : List TraceEvent) : Except Str
     | event :: rest =>
         match checkEvent state event with
         | .ok state' => go state' rest (index + 1)
-        | .error reason => .error s!"event {index}: {reason}"
+        | .error reason => .error s!"event {index} ({event.kind}): {reason}"
   go (ReplayState.empty config) events 1
 
 private def scenarioRequirements (label : String) (state : ReplayState) : Except String Unit := do
@@ -580,7 +593,7 @@ def replayFile (tracePath configPath label : String) : IO Bool := do
       | .ok state =>
           match scenarioRequirements label state with
           | .ok _ =>
-              IO.println s!"[{label}] CONFORMANT ✓ ({events.length} events checked)"
+              IO.println s!"[{label}] CONFORMANT ✓\n  events: {events.length}\n  finality checks: {state.finalityChecks}\n  equivocation checks: {state.equivocationChecks}\n  tau checks: {state.tauChecks}\n  output checks: {state.outputChecks}"
               pure true
           | .error reason =>
               IO.println s!"[{label}] MISMATCH ✗\n  incomplete scenario: {reason}"
