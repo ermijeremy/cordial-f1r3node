@@ -2,20 +2,54 @@ name: Lean
 
 on:
   push:
-    branches: ["lean-q1"]
-    paths: ["lean/**"]
+    branches: ["lean-q1", "lean-q1-kr5-trace-replay"]
+    paths:
+      - "lean/**"
+      - "crates/cordial-miners-core/**"
+      - "docs/lean/05*.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "Justfile"
+      - ".github/workflows/lean.yml"
   pull_request:
     branches: ["lean-q1", "dev", "master"]
-    paths: ["lean/**"]
+    paths:
+      - "lean/**"
+      - "crates/cordial-miners-core/**"
+      - "docs/lean/05*.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "Justfile"
+      - ".github/workflows/lean.yml"
     types: [opened, synchronize, reopened]
 
 jobs:
-  build:
+  conformance:
     runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: "2"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Rust default build
+        run: cargo build -j 2 -p cordial-miners-core
+
+      - name: Rust default tests
+        run: cargo test -j 2 -p cordial-miners-core
+
+      - name: Rust trace tests
+        run: cargo test -j 2 -p cordial-miners-core --features trace
+
+      - name: Generate deterministic canonical traces
+        run: |
+          cargo test -j 2 -p cordial-miners-core --features trace \
+            --test generate_trace_fixtures generate_all_fixtures -- \
+            --exact --nocapture --test-threads=1
+          git diff --exit-code -- lean/traces
 
       - name: Cache Mathlib build artifacts
         uses: actions/cache@v4
@@ -30,6 +64,18 @@ jobs:
         with:
           lake-package-directory: lean
           build-args: "--log-level=info"
+
+      - name: Build replay executables
+        working-directory: lean
+        run: lake build replay_runner conformance_tests
+
+      - name: Replay positive Rust traces
+        working-directory: lean
+        run: lake exe replay_runner
+
+      - name: Reject negative and mutation traces
+        working-directory: lean
+        run: lake exe conformance_tests
 
       - name: Fail on sorry
         working-directory: lean
