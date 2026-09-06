@@ -14,7 +14,8 @@ before executing its scenario.
 
 ## Canonical encoding rules
 
-- Every non-empty line is exactly one JSON object with an `event` tag.
+- Every record is exactly one JSON object with an `event` tag. A final line
+  terminator is allowed, but an empty record in the middle is an error.
 - Unknown events, unknown fields, missing fields, wrong types, malformed JSON,
   and invalid enum strings are errors in Lean.
 - Required nullable fields are present as JSON `null`; omission is not treated
@@ -75,22 +76,90 @@ never treated as quorum evidence.
 
 ## Canonical scenarios
 
-| Scenario | Actual properties exercised |
-|---|---|
-| `normal` | 21 insertions, approvals, ratification/super-ratification certificates, finalized leader, τ, output item and prefix hash |
-| `equivocation` | valid insertion/validation, node 7 same-round fork detection, approvals/certificates, and safe finality of honest leader node 1 |
-| `low_stake` | five voters by count but only 1004/3004 stake; count finality succeeds in the Rust scenario assertion while weighted Rust and Lean finality reject |
+All three files are produced by
+`tests/generate_trace_fixtures.rs::generate_all_fixtures`; they are not
+handwritten protocol transcripts.
+
+### `normal`
+
+- Validators: nodes `01` through `07`, weight 100 each (total 700).
+- Blocks: seven blocks at each of rounds 0, 1, and 2. Every round-1 block
+  references every round-0 block, and likewise for round 2.
+- Wave/leader: wavelength 3, wave 0 leader is node `01`'s round-0 block.
+- Evidence: the real approval evaluator emits 16 unique approval facts; the
+  weighted code emits seven ratification certificates and one
+  super-ratification certificate.
+- Expected result: the leader is finalized. Weighted `tau` emits the leader as
+  its one-item output; both the exact order and running output-prefix hash are
+  replayed by Lean.
+- Principal trace events: 21 `insert_block`, 16 `accept_approval`, eight
+  `build_threshold_certificate`, one `compute_finality`, one `run_tau_order`,
+  and one `emit_output` (48 total).
+
+### `equivocation`
+
+- Validators: nodes `01` through `07`, weight 100 each (total 700).
+- Blocks: node `07` creates two distinct incomparable round-0 blocks. Nodes
+  `01` through `06` each create one round-0 block and six blocks in each of
+  rounds 1 and 2; the later honest blocks acknowledge both forks.
+- Wave/leader: wavelength 3, wave 0 leader is honest node `01`.
+- Evidence: an actual validation call and actual equivocation scan report node
+  `07`'s same-round fork; node `07` is excluded from approvals while the six
+  honest validators still carry 600/700 weight. Rust emits six ratification
+  certificates and one super-ratification certificate.
+- Expected result: exactly the reported node-07 fork is an equivocation and
+  the honest leader remains finalized. This scenario calls finality directly,
+  so it intentionally has no `run_tau_order` or `emit_output` event.
+- Principal trace events: 20 `insert_block`, one `validate_block`, one
+  `detect_equivocation`, 13 `accept_approval`, seven certificates, and one
+  `compute_finality` (43 total).
+
+### `low_stake`
+
+- Validators: nodes `01`–`03` have weight 1000; nodes `04`–`07` have weight 1
+  (total 3004).
+- Blocks: all seven validators create round-0 blocks. Only nodes
+  `01,04,05,06,07` participate in rounds 1 and 2, for 17 blocks total.
+- Wave/leader: wavelength 3, wave 0 leader is node `01`.
+- Evidence: five validators form a count quorum, but their distinct stake is
+  only 1004/3004. Rust's count-based control assertion finalizes; the weighted
+  implementation does not build a certificate and returns no final leader.
+- Expected result: `not_finalized`. Lean independently obtains the same answer
+  from the sidecar weights and strict `3 * support > 2 * total` arithmetic.
+  This direct-finality scenario intentionally has no tau/output event.
+- Principal trace events: 17 `insert_block`, 57 actual approval evaluations,
+  no certificate, and one `compute_finality` (75 total).
 
 The generator executes every scenario twice and compares all six trace/config
 files byte-for-byte. This catches randomized set traversal and unstable ids.
 
+## Genuine threshold mutation
+
+Cargo feature `trace-threshold-mutation` is a deliberately broken, test-only
+feature that replaces the production predicate with `2 * support > total`.
+It implies `trace` and is never used by normal builds. The mutation generator
+runs the real approval → certificate → finality call path with four equally
+weighted participants out of seven and writes only to a temporary directory.
+`scripts/issue188_mutation_test.sh` feeds that trace to unchanged Lean code and
+requires rejection. The script does not edit a recorded decision and does not
+write the mutated trace into `lean/traces/`.
+
 ## Adapter and formal trust boundaries
 
-The trace does not expose payload or signatures. Replay interns each unique
-Rust block hash as a fresh opaque formal `BlockId`, retains creator and parent
-edges, and dynamically rejects duplicate hashes. Cryptographic validation of
-the digest/signature remains on the Rust side; DAG closure and all consensus
-predicates are re-established in Lean.
+The canonical trace deliberately omits application payload bytes and
+signatures. For every accepted insertion, replay creates a formal `Block`
+whose creator and predecessor set are the checked trace values. Its payload is
+an injective compact insertion tag, and its id is exactly
+`hashContent creator content`; therefore the original KR1 `Block.id_eq`
+invariant is preserved rather than removed. `ReplayedBlock` maintains the
+one-to-one association between that formal id and the externally reported Rust
+digest. Duplicate Rust digests and formal-id collisions are both rejected.
+
+Cryptographic digest/signature validation remains a Rust-side trust boundary:
+Issue #188 replay checks the consensus semantics exposed by the trace, not the
+signature algorithm. DAG closure, observation, equivocation, approval,
+weighted certificates, finality, ordering, and output are independently
+re-established in Lean.
 
 `Ordering.lean` retains the earlier abstract `tau_prefix_monotone` axiom as a
 documented KR4 prefix-safety trust boundary. Issue #188 replay does not use that

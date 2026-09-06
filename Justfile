@@ -67,7 +67,10 @@ issue188-lean:
     cd lean && lake exe conformance_tests
     just lean-check-sorry
 
-issue188-conformance: issue188-rust issue188-lean
+issue188-mutation:
+    bash scripts/issue188_mutation_test.sh
+
+issue188-conformance: issue188-rust issue188-lean issue188-mutation
 
 demo-cordial-env:
     cp -n docker/.env.example {{docker_env}}

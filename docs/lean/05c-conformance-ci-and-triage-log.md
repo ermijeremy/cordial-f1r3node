@@ -1,14 +1,14 @@
-# 05c — Conformance CI and triage
+# 05c — Conformance CI and triage log
 
 ## Reproducible pipeline
 
-Run the full local pipeline with:
+Run the complete local gate from the repository root:
 
 ```bash
 just issue188-conformance
 ```
 
-Its substantive commands are:
+The gate executes these stages sequentially:
 
 ```bash
 cargo build -j 2 -p cordial-miners-core
@@ -17,63 +17,155 @@ cargo test -j 2 -p cordial-miners-core --features trace
 cargo test -j 2 -p cordial-miners-core --features trace \
   --test generate_trace_fixtures generate_all_fixtures -- \
   --exact --nocapture --test-threads=1
+
 cd lean
 lake build replay_runner conformance_tests
 lake exe replay_runner
 lake exe conformance_tests
+cd ..
+bash scripts/issue188_mutation_test.sh
 ```
 
-The Lake targets pass `-j 2` to Lean through `moreLeanArgs`. Cargo commands use
-two jobs, and fixture generation is explicitly single-threaded because it
-changes the process-local trace sink. CI runs Rust default mode before trace
-mode, regenerates and diffs committed fixtures, builds Lean, replays positive
-fixtures, rejects negative/mutation cases, and scans the Lean build for
-`declaration uses 'sorry'`.
+Cargo is limited to two jobs and the three fixture scenarios share one test
+thread because they switch `CORDIAL_TRACE_FILE`. Lake 5 has no `build -j`
+flag; the package limits each Lean invocation using
+`moreLeanArgs = ["-j", "2"]` in `lean/lakefile.toml`. Check available memory
+before running the Rust and Lean builds together with other workloads.
 
-## Expected results
+## Trace generation and determinism
+
+`generate_all_fixtures` truncates each destination, executes the actual Rust
+consensus functions, and writes `lean/traces/{normal,equivocation,low_stake}.json`
+plus their weight/leader sidecars. It immediately performs the same executions
+a second time and compares all six files byte-for-byte. Set-valued fields are
+sorted before serialization; ids and prefix hashes are deterministic; no wall
+clock value is part of the semantic trace.
+
+CI then runs `git diff --exit-code -- lean/traces`. A consensus or schema
+change must therefore either preserve the canonical execution exactly or be
+accompanied by a deliberately reviewed fixture/model update.
+
+## What conformance means
+
+A fixture is conformant only if:
+
+1. every non-empty line parses as one known, fully typed event;
+2. the external sidecar is canonical and its recomputed hash equals every
+   weighted trace reference;
+3. insertions construct a proof-valid predecessor-closed formal Blocklace;
+4. the CMRef independently validates every reported equivocation, approval,
+   certificate, finality decision, tau order, and emitted output item; and
+5. scenario-specific non-vacuity requirements are met.
+
+The positive runner prints counts such as:
 
 ```text
 [normal] CONFORMANT ✓
-[equivocation] CONFORMANT ✓
-[low_stake] CONFORMANT ✓
-
-[negative/invalid-finality] rejected ✓
-...
-[negative/weakened-threshold-mutation] rejected ✓
+  events: 48
+  finality checks: 1
+  equivocation checks: 0
+  tau checks: 1
+  output checks: 1
 ```
 
-The fixture generator also reports deterministic byte-for-byte regeneration.
-A schema change that is not reflected in Lean, a changed canonical trace, a
-formal mismatch, an accepted mutation, or a `sorry` makes CI fail.
+The expected outcomes are `CONFORMANT` for normal, equivocation, and
+low-stake. Low-stake is a positive conformance fixture whose expected weighted
+decision is `not_finalized`; accepting a trace does not mean every candidate
+was finalized.
 
-## First-mismatch diagnostics
+## Negative and mutation gates
 
-Parsing errors include a one-based line number. Replay errors include a
-one-based event number. Finality failures additionally show node, wave, block,
-the Rust decision, the Lean CMRef decision, support/total weight, and the
-strict-threshold formula. Certificate, equivocation, τ and output failures name
-the relevant hashes and the independently computed value.
+`lake exe conformance_tests` checks all 15 parser variants and rejects:
 
-Triage the first mismatch by layer:
+- malformed JSON, unknown events, omitted required nullable fields, wrong
+  types, and unknown fields;
+- invalid predecessor closure;
+- an incorrect finality decision;
+- insufficient weighted quorum;
+- an invalid certificate id/evidence;
+- a false equivocation report;
+- an incorrect tau order;
+- an incorrect output-prefix hash; and
+- a wrong weight-table hash.
 
-| Diagnostic | First place to inspect |
+The true mutation gate is separate. Cargo feature
+`trace-threshold-mutation` compiles the Rust quorum predicate as
+`2 * support > total`, executes the real approval/certificate/finality path
+with four of seven equally weighted validators, and writes the trace to an
+ephemeral directory. Unmodified Lean must reject it. A successful mutation
+gate looks like:
+
+```text
+[mutation/weakened-threshold] actual Rust execution wrote /tmp/.../weakened_threshold.json
+[weakened_threshold] MISMATCH ✗
+  event 20 (build_threshold_certificate): insufficient quorum: support=400, total=700, required 3*support > 2*total
+[mutation/weakened-threshold] rejected by independent Lean quorum ✓
+```
+
+The mutation is opt-in, test-only, and never changes committed fixtures. The
+shell command fails if Rust does not produce the bad certificate, if Lean
+accepts it, or if rejection occurs for an unrelated reason.
+
+## CI behavior
+
+`.github/workflows/lean.yml` runs on relevant pushes and pull requests. It:
+
+1. builds and tests the default, non-tracing core;
+2. tests the trace-enabled core, including runtime instrumentation coverage;
+3. regenerates and byte-compares canonical fixtures;
+4. builds the Lean library and both executables;
+5. runs all positive replays;
+6. runs parser/semantic negative tests;
+7. runs the actual weakened-Rust-threshold gate; and
+8. fails if the Lean build reports `declaration uses 'sorry'`.
+
+This makes conformance fail for an unmirrored schema change, nondeterministic
+trace, invalid positive execution, accepted negative, accepted Rust mutation,
+or a new proof hole. Default builds do not execute tracing work: without
+feature `trace`, `trace::emit` is an inline no-op and event construction sites
+are `cfg`-gated.
+
+## First-mismatch triage
+
+Parsing errors identify the one-based line. Semantic errors identify the
+one-based event and canonical event kind. Replay stops at that first mismatch.
+
+| Diagnostic | Initial classification and inspection point |
 |---|---|
-| `line N` JSON/schema error | Rust `trace.rs` and Lean `Trace.lean` |
-| missing/duplicate predecessor or wrong round | instrumentation order and replayed Blocklace |
-| weight-table hash mismatch | sidecar ordering/weights and FNV encoding |
-| approval/equivocation predicate rejects | Rust KR2 behavior vs `CMRef`/formal KR2 model |
-| certificate or finality mismatch | approval evidence, stake arithmetic, leader/wave configuration |
-| τ/order mismatch | latest finalized leader, recursive ratification, hash tie-break order |
-| output prefix mismatch | output index/order or FNV prefix encoding |
+| `line N` JSON/schema error | trace/instrumentation bug: compare Rust `trace.rs` with Lean `Trace.lean` |
+| missing/duplicate predecessor or wrong round | Rust insertion/instrumentation order versus `ReplayDag` |
+| weight-table hash mismatch | configuration/adapter bug: sorted table and FNV encoding |
+| approval/equivocation rejection | Rust KR2 behavior versus `CMRef` and formal `Equivocation`/`Approves` |
+| certificate mismatch | evidence membership/deduplication, `WCert`, stake table, or certificate id |
+| finality mismatch | approval → ratification → super-ratification evidence and leader/wave configuration |
+| tau mismatch | latest finalized leader, prior-leader recursion, approval filter, or hash tie-break |
+| output mismatch | tau result, output index, or FNV prefix encoding |
 
-Do not resolve a mismatch by accepting both decisions or skipping malformed
-events. Determine whether it is a Rust behavior bug, a trace/schema adapter
-bug, or a Lean formal-model bug, then keep the independent comparison intact.
+Classify a discrepancy as one of: Rust implementation bug, Lean model/proof
+bug, trace/schema adapter bug, or an explicitly documented semantic boundary.
+Never fix it by accepting both results, skipping a line, weakening a threshold,
+or deriving the expected answer from the trace's result field.
 
-## Mutation record
+## Safe fixture update procedure
 
-The permanent threshold mutation test changes the low-stake trace's Rust claim
-from `not_finalized` to `finalized` (the behavior produced by an incorrect
-count/half threshold) and supplies a fake certificate id. CMRef still computes
-1004 of 3004 stake and rejects the decision as a finality mismatch. Restoring
-the genuine weighted Rust result makes the positive low-stake replay pass.
+1. Explain the intended protocol/schema change and identify its formal model.
+2. Update Rust instrumentation and Lean typed schema together.
+3. Update or prove the relevant executable-to-Prop bridge before replay logic.
+4. Run the generator twice (the test does this automatically).
+5. Inspect semantic and weight-sidecar diffs, not only JSON validity.
+6. Run positive, negative, mutation, and no-`sorry` gates.
+7. Record any genuine discrepancy below before accepting fixture changes.
+
+## Running triage log
+
+| Date | Observation | Classification | Resolution |
+|---|---|---|---|
+| 2026-09-07 | Set-valued parent/evidence fields could follow randomized `HashSet` traversal. | trace determinism bug | Centralized sorted hash/member encoding and made fixture generation compare two complete executions byte-for-byte. |
+| 2026-09-07 | The former string-search parser could collapse `null` and missing numeric fields to defaults. | trace/schema adapter bug | Replaced it with Lean's JSON parser, strict field/type checks, and `Option Nat`; added malformed/unknown/missing/wrong-type/extra-field tests. |
+| 2026-09-07 | A proposed mutation check only flipped a parsed finality result, so it did not prove CI caught broken Rust code. | test-oracle bug | Added opt-in compilation of the actual weaker Rust predicate and an ephemeral execution harness; Lean rejects its first bad certificate at support 400/700. |
+| 2026-09-07 | Replaying an opaque Rust digest by assigning an arbitrary formal id would drop KR1's `Block.id_eq` premise. | Lean adapter/model bug | Restored `id_eq`, retained executable injective `hashContent`, and construct each replay block with `id := hashContent creator content`; Rust digest association stays separate and checked. |
+| 2026-09-07 | The trace intentionally omits payload bytes and signatures. | documented boundary | Lean models payload with an injective opaque tag and verifies all DAG/consensus semantics. Rust remains responsible for cryptographic digest/signature validation; documentation does not claim otherwise. |
+
+The GitHub workflow contains the mutation gate, but no throwaway remote PR is
+created by this repository command. A hosted branch-protection demonstration
+is an external release/operations step, not part of local replay execution.
