@@ -1,11 +1,11 @@
 use crate::block::Block;
+#[cfg(feature = "trace")]
+use crate::consensus::round::{candidate_depth, depth};
 use crate::crypto::CryptoVerifier;
-use crate::types::{BlockContent, BlockIdentity, NodeId};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(feature = "trace")]
 use crate::trace::{self, BlockLifecycleEvent, TraceEvent};
-#[cfg(feature = "trace")]
-use crate::consensus::round::depth;
+use crate::types::{BlockContent, BlockIdentity, NodeId};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 // The blocklace B - a set of blocks satisfying the closure and axioms
 // From definition 2.3, A blocklace B is a set of blocks subject to some invariants.
@@ -60,8 +60,27 @@ impl Blocklace {
     /// The caller is responsible for having validated the block; this is the
     /// commit step only.
     pub(crate) fn commit_validated(&mut self, id: BlockIdentity, content: BlockContent) {
+        #[cfg(feature = "trace")]
+        let (block_hash, creator, parent_hashes) = (
+            trace::hex(&id.content_hash),
+            trace::hex(&id.creator.0),
+            trace::sorted_block_hashes(&content.predecessors),
+        );
+        #[cfg(feature = "trace")]
+        let inserted_id = id.clone();
         self.blocks.insert(id, content);
         self.generation += 1;
+        #[cfg(feature = "trace")]
+        trace::emit(TraceEvent::InsertBlock(BlockLifecycleEvent {
+            node_id: creator.clone(),
+            wave: None,
+            round: depth(self, &inserted_id),
+            block_hash,
+            parent_hashes,
+            missing_parent_hashes: vec![],
+            creator,
+            weight_table_hash: None,
+        }));
     }
 
     /// Remove a block, bumping the generation if anything was removed.
@@ -170,18 +189,14 @@ impl Blocklace {
         if !missing.is_empty() {
             #[cfg(feature = "trace")]
             {
-                let round = depth(self, &block.identity).unwrap_or(0);
+                let round = candidate_depth(self, &block.content);
                 trace::emit(TraceEvent::BufferBlock(BlockLifecycleEvent {
                     node_id: trace::hex(&block.identity.creator.0),
                     wave: None,
                     round,
                     block_hash: trace::hex(&block.identity.content_hash),
-                    parent_hashes: block
-                        .content
-                        .predecessors
-                        .iter()
-                        .map(|p| trace::hex(&p.content_hash))
-                        .collect(),
+                    parent_hashes: trace::sorted_block_hashes(&block.content.predecessors),
+                    missing_parent_hashes: trace::sorted_block_hashes(missing.iter().copied()),
                     creator: trace::hex(&block.identity.creator.0),
                     weight_table_hash: None,
                 }));
@@ -192,35 +207,9 @@ impl Blocklace {
             ));
         }
 
-        // 3. Commit to state
-        #[cfg(feature = "trace")]
-        let (block_hash_hex, creator_hex, parent_hashes_hex) = {
-            let bh = trace::hex(&block.identity.content_hash);
-            let cr = trace::hex(&block.identity.creator.0);
-            let ph: Vec<String> = block
-                .content
-                .predecessors
-                .iter()
-                .map(|p| trace::hex(&p.content_hash))
-                .collect();
-            (bh, cr, ph)
-        };
-
+        // 3. Commit to state. The commit method is the single insertion trace
+        // site shared with `validated_insert`.
         self.commit_validated(block.identity.clone(), block.content);
-
-        #[cfg(feature = "trace")]
-        {
-            let round = depth(self, &block.identity).unwrap_or(0);
-            trace::emit(TraceEvent::InsertBlock(BlockLifecycleEvent {
-                node_id: creator_hex.clone(),
-                wave: None,
-                round,
-                block_hash: block_hash_hex,
-                parent_hashes: parent_hashes_hex,
-                creator: creator_hex,
-                weight_table_hash: None,
-            }));
-        }
 
         Ok(())
     }

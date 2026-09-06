@@ -5,13 +5,11 @@ use crate::blocklace::Blocklace;
 use crate::consensus::cordiality::{hidden_equivocations, is_cordial_block, missing_known_tips};
 use crate::consensus::fork_choice::collect_validator_tips;
 #[cfg(feature = "trace")]
-use crate::consensus::round::depth;
-#[cfg(feature = "trace")]
-use crate::consensus::wave::wave_of_round;
+use crate::consensus::round::candidate_depth;
 use crate::crypto;
-use crate::types::{BlockIdentity, NodeId};
 #[cfg(feature = "trace")]
 use crate::trace::{self, TraceEvent, ValidateBlockEvent};
+use crate::types::{BlockIdentity, NodeId};
 
 /// Reasons a block can be rejected during validation.
 ///
@@ -243,19 +241,13 @@ pub fn validate_block(
     if errors.is_empty() {
         #[cfg(feature = "trace")]
         {
-            let round = depth(blocklace, &block.identity).unwrap_or(0);
-            let wave = wave_of_round(round, 4); // default wavelength=4; caller may override
+            let round = candidate_depth(blocklace, &block.content);
             trace::emit(TraceEvent::ValidateBlock(ValidateBlockEvent {
                 node_id: trace::hex(&block.identity.creator.0),
-                wave,
+                wave: None,
                 round,
                 block_hash: trace::hex(&block.identity.content_hash),
-                parent_hashes: block
-                    .content
-                    .predecessors
-                    .iter()
-                    .map(|p| trace::hex(&p.content_hash))
-                    .collect(),
+                parent_hashes: trace::sorted_block_hashes(&block.content.predecessors),
                 creator: trace::hex(&block.identity.creator.0),
                 weight_table_hash: None,
                 outcome: "valid".into(),
@@ -266,19 +258,13 @@ pub fn validate_block(
     } else {
         #[cfg(feature = "trace")]
         {
-            let round = depth(blocklace, &block.identity).unwrap_or(0);
-            let wave = wave_of_round(round, 4);
+            let round = candidate_depth(blocklace, &block.content);
             trace::emit(TraceEvent::ValidateBlock(ValidateBlockEvent {
                 node_id: trace::hex(&block.identity.creator.0),
-                wave,
+                wave: None,
                 round,
                 block_hash: trace::hex(&block.identity.content_hash),
-                parent_hashes: block
-                    .content
-                    .predecessors
-                    .iter()
-                    .map(|p| trace::hex(&p.content_hash))
-                    .collect(),
+                parent_hashes: trace::sorted_block_hashes(&block.content.predecessors),
                 creator: trace::hex(&block.identity.creator.0),
                 weight_table_hash: None,
                 outcome: "invalid".into(),

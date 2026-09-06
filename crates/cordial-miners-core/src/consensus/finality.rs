@@ -6,9 +6,9 @@ use crate::blocklace::Blocklace;
 use crate::consensus::cordiality::{super_ratifies, weighted_super_ratifies};
 use crate::consensus::round::{blocks_at_depth, compute_all_depths, depth};
 use crate::consensus::wave::{last_round_of_wave, leader_blocks_of_wave, wave_of_round};
-use crate::types::{BlockIdentity, NodeId};
 #[cfg(feature = "trace")]
 use crate::trace::{self, ComputeFinalityEvent, TraceEvent};
+use crate::types::{BlockIdentity, NodeId};
 
 type RoundIndex = HashMap<u64, Vec<Block>>;
 
@@ -107,10 +107,16 @@ where
     trace::emit(TraceEvent::ComputeFinality(ComputeFinalityEvent {
         node_id: trace::hex(&candidate.creator.0),
         wave,
+        wavelength,
         block_hash: trace::hex(&candidate.content_hash),
-        decision: if result { "finalized".into() } else { "not_finalized".into() },
+        decision: if result {
+            "finalized".into()
+        } else {
+            "not_finalized".into()
+        },
         certificate_id: None,
         output_prefix_hash: None,
+        weight_table_hash: "unweighted".into(),
     }));
 
     result
@@ -255,7 +261,29 @@ where
         .flat_map(|round| blocks_at_depth(blocklace, round))
         .collect();
 
-    weighted_super_ratifies(blocklace, &witness_blocks, &candidate_block, bonds)
+    let result = weighted_super_ratifies(blocklace, &witness_blocks, &candidate_block, bonds);
+
+    #[cfg(feature = "trace")]
+    {
+        let block_hash = trace::hex(&candidate.content_hash);
+        trace::emit(TraceEvent::ComputeFinality(ComputeFinalityEvent {
+            node_id: trace::hex(&candidate.creator.0),
+            wave,
+            wavelength,
+            block_hash: block_hash.clone(),
+            decision: if result {
+                "finalized".into()
+            } else {
+                "not_finalized".into()
+            },
+            certificate_id: result
+                .then(|| trace::certificate_id("super_ratification", &block_hash, None)),
+            output_prefix_hash: None,
+            weight_table_hash: trace::weight_table_hash(bonds),
+        }));
+    }
+
+    result
 }
 
 /// Return the weighted final leader block for a wave, if one exists.
@@ -323,7 +351,27 @@ where
         };
 
         let witness_blocks = witness_blocks_from_index(&rounds, candidate_round, last_round);
-        if weighted_super_ratifies(blocklace, &witness_blocks, &leader, bonds) {
+        let result = weighted_super_ratifies(blocklace, &witness_blocks, &leader, bonds);
+        #[cfg(feature = "trace")]
+        {
+            let block_hash = trace::hex(&leader.identity.content_hash);
+            trace::emit(TraceEvent::ComputeFinality(ComputeFinalityEvent {
+                node_id: trace::hex(&leader.identity.creator.0),
+                wave,
+                wavelength,
+                block_hash: block_hash.clone(),
+                decision: if result {
+                    "finalized".into()
+                } else {
+                    "not_finalized".into()
+                },
+                certificate_id: result
+                    .then(|| trace::certificate_id("super_ratification", &block_hash, None)),
+                output_prefix_hash: None,
+                weight_table_hash: trace::weight_table_hash(bonds),
+            }));
+        }
+        if result {
             return Some(leader.identity);
         }
     }

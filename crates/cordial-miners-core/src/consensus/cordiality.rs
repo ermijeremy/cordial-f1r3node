@@ -13,15 +13,17 @@
 //! That makes these predicates usable inside block validation, where the
 //! creator's private local view is not available.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::block::Block;
 use crate::blocklace::Blocklace;
+#[cfg(feature = "trace")]
+use crate::consensus::approval::approves_with_memo;
 use crate::consensus::approval::{ApprovalMemo, approves, weighted_approving_creators_with_memo};
 use crate::consensus::round::{blocks_at_depth, depth};
-use crate::types::{BlockIdentity, NodeId};
 #[cfg(feature = "trace")]
-use crate::trace::{self, DetectEquivocationEvent, TraceEvent};
+use crate::trace::{self, DetectEquivocationEvent, ThresholdCertificateEvent, TraceEvent};
+use crate::types::{BlockIdentity, NodeId};
 
 /// A same-round equivocation detected in the blocklace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +84,7 @@ pub fn all_equivocations(blocklace: &Blocklace) -> Vec<Equivocation> {
     else {
         return Vec::new();
     };
-    let creators: HashSet<NodeId> = blocklace
+    let creators: BTreeSet<NodeId> = blocklace
         .dom()
         .iter()
         .map(|id| id.creator.clone())
@@ -257,8 +259,10 @@ pub fn super_ratifies(
     n: usize,
     f: usize,
 ) -> bool {
-    let ratifying_blocks: HashSet<Block> = blocks
-        .iter()
+    let mut ordered_blocks: Vec<_> = blocks.iter().collect();
+    ordered_blocks.sort_by_key(|block| block.identity.clone());
+    let ratifying_blocks: HashSet<Block> = ordered_blocks
+        .into_iter()
         .filter(|b| ratifies(blocklace, b, target, n, f))
         .cloned()
         .collect();
@@ -312,7 +316,67 @@ fn weighted_ratifies_with_memo(
             &mut memo.approval_memo,
         );
 
-        is_weighted_supermajority(&approving_creators, bonds)
+        let passed = is_weighted_supermajority(&approving_creators, bonds);
+
+        #[cfg(feature = "trace")]
+        if passed {
+            let mut ordered_observed: Vec<_> = observed_blocks.iter().collect();
+            ordered_observed.sort_by_key(|block| block.identity.clone());
+            let approver_blocks: Vec<_> = ordered_observed
+                .into_iter()
+                .filter(|block| {
+                    // Every pair was evaluated immediately above. Reuse that
+                    // memoized result so formatting certificate evidence does
+                    // not emit duplicate, HashSet-ordered approval events.
+                    approves_with_memo(
+                        blocklace,
+                        &block.identity,
+                        &target.identity,
+                        &mut memo.approval_memo,
+                    ) && bonds.get(&block.identity.creator).copied().unwrap_or(0) > 0
+                })
+                .collect();
+            let mut creators: Vec<_> = approving_creators.iter().collect();
+            creators.sort();
+            let support = checked_bond_weight(
+                approving_creators
+                    .iter()
+                    .filter_map(|creator| bonds.get(creator))
+                    .copied(),
+            )
+            .unwrap_or(0);
+            let total = checked_bond_weight(bonds.values().copied()).unwrap_or(0);
+            let leader_hash = trace::hex(&target.identity.content_hash);
+            let ratifier_hash = trace::hex(&ratifier.identity.content_hash);
+            trace::emit(TraceEvent::BuildThresholdCertificate(
+                ThresholdCertificateEvent {
+                    node_id: trace::hex(&ratifier.identity.creator.0),
+                    wave: None,
+                    kind: "ratification".into(),
+                    leader_hash: leader_hash.clone(),
+                    ratifier_hash: Some(ratifier_hash.clone()),
+                    certificate_id: trace::certificate_id(
+                        "ratification",
+                        &leader_hash,
+                        Some(&ratifier_hash),
+                    ),
+                    approver_hashes: approver_blocks
+                        .iter()
+                        .map(|block| trace::hex(&block.identity.content_hash))
+                        .collect(),
+                    approvers: creators
+                        .iter()
+                        .map(|creator| trace::hex(&creator.0))
+                        .collect(),
+                    approver_count: approving_creators.len(),
+                    approver_weight: support,
+                    total_weight: total,
+                    weight_table_hash: trace::weight_table_hash(bonds),
+                },
+            ));
+        }
+
+        passed
     };
 
     memo.weighted_ratifies_cache.insert(cache_key, result);
@@ -342,19 +406,66 @@ fn weighted_super_ratifies_with_memo(
     bonds: &HashMap<NodeId, u64>,
     memo: &mut WeightedRatificationMemo,
 ) -> bool {
-    let ratifying_creators: HashSet<NodeId> = blocks
-        .iter()
+    // Ratification recursively emits approvals and certificates.  Evaluate
+    // witnesses in identity order so equivalent executions have byte-stable
+    // traces despite HashSet's randomized iteration order.
+    let mut ordered_blocks: Vec<_> = blocks.iter().collect();
+    ordered_blocks.sort_by_key(|block| block.identity.clone());
+    let ratifying_blocks: Vec<&Block> = ordered_blocks
+        .into_iter()
         .filter(|block| weighted_ratifies_with_memo(blocklace, block, target, bonds, memo))
-        .filter_map(|block| {
+        .filter(|block| {
             let creator = &block.identity.creator;
-            match bonds.get(creator).copied() {
-                Some(weight) if weight > 0 => Some(creator.clone()),
-                _ => None,
-            }
+            bonds.get(creator).copied().unwrap_or(0) > 0
         })
         .collect();
+    let ratifying_creators: HashSet<NodeId> = ratifying_blocks
+        .iter()
+        .map(|block| block.identity.creator.clone())
+        .collect();
 
-    is_weighted_supermajority(&ratifying_creators, bonds)
+    let passed = is_weighted_supermajority(&ratifying_creators, bonds);
+
+    #[cfg(feature = "trace")]
+    if passed {
+        let mut evidence = ratifying_blocks;
+        evidence.sort_by_key(|block| block.identity.clone());
+        let mut creators: Vec<_> = ratifying_creators.iter().collect();
+        creators.sort();
+        let support = checked_bond_weight(
+            ratifying_creators
+                .iter()
+                .filter_map(|creator| bonds.get(creator))
+                .copied(),
+        )
+        .unwrap_or(0);
+        let total = checked_bond_weight(bonds.values().copied()).unwrap_or(0);
+        let leader_hash = trace::hex(&target.identity.content_hash);
+        trace::emit(TraceEvent::BuildThresholdCertificate(
+            ThresholdCertificateEvent {
+                node_id: trace::hex(&target.identity.creator.0),
+                wave: None,
+                kind: "super_ratification".into(),
+                leader_hash: leader_hash.clone(),
+                ratifier_hash: None,
+                certificate_id: trace::certificate_id("super_ratification", &leader_hash, None),
+                approver_hashes: evidence
+                    .iter()
+                    .map(|block| trace::hex(&block.identity.content_hash))
+                    .collect(),
+                approvers: creators
+                    .iter()
+                    .map(|creator| trace::hex(&creator.0))
+                    .collect(),
+                approver_count: ratifying_creators.len(),
+                approver_weight: support,
+                total_weight: total,
+                weight_table_hash: trace::weight_table_hash(bonds),
+            },
+        ));
+    }
+
+    passed
 }
 
 /// Check whether `creators` hold strictly more than two-thirds of total bonded
