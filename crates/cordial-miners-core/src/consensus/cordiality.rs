@@ -500,6 +500,7 @@ fn checked_bond_weight(weights: impl IntoIterator<Item = u64>) -> Option<u128> {
         .try_fold(0u128, |total, weight| total.checked_add(u128::from(weight)))
 }
 
+#[cfg(not(feature = "trace-threshold-mutation"))]
 fn strict_two_thirds(support_weight: u128, total_weight: u128) -> bool {
     let Some(weighted_support) = support_weight.checked_mul(3) else {
         return false;
@@ -509,6 +510,21 @@ fn strict_two_thirds(support_weight: u128, total_weight: u128) -> bool {
     };
 
     weighted_support > threshold
+}
+
+/// Deliberately weakened quorum predicate for the Issue #188 mutation test.
+///
+/// This is compiled only by the dedicated mutation harness. It exercises the
+/// real approval, certificate and finality call graph while demonstrating
+/// that Lean rejects a Rust implementation changed from strict two-thirds to
+/// a simple majority.
+#[cfg(feature = "trace-threshold-mutation")]
+fn strict_two_thirds(support_weight: u128, total_weight: u128) -> bool {
+    let Some(weighted_support) = support_weight.checked_mul(2) else {
+        return false;
+    };
+
+    weighted_support > total_weight
 }
 
 /// Check if a set of blocks constitutes a supermajority.

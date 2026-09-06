@@ -25,6 +25,7 @@ use cordial_miners_core::consensus::cordiality::all_equivocations;
 use cordial_miners_core::consensus::ordering::weighted_tau;
 use cordial_miners_core::consensus::validation::{ValidationConfig, validate_block};
 use cordial_miners_core::crypto::CryptoVerifier;
+use cordial_miners_core::trace::TraceEvent;
 use cordial_miners_core::{Block, BlockContent, BlockIdentity, NodeId};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -80,14 +81,17 @@ fn insert(blocklace: &mut Blocklace, block: &Block) {
 
 /// Return the path for a trace fixture, creating parent dirs as needed.
 fn fixture_path(name: &str) -> PathBuf {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent() // crates/
-        .unwrap()
-        .parent() // workspace root
-        .unwrap()
-        .to_path_buf();
-
-    let dir = root.join("lean").join("traces");
+    let dir = std::env::var_os("CORDIAL_TRACE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent() // crates/
+                .unwrap()
+                .parent() // workspace root
+                .unwrap()
+                .join("lean")
+                .join("traces")
+        });
     std::fs::create_dir_all(&dir).expect("failed to create traces/ dir");
     dir.join(name)
 }
@@ -143,6 +147,14 @@ fn prepare_fixture(name: &str, bonds: &HashMap<NodeId, u64>, wavelength: u64) ->
     std::fs::write(weights_path, serde_json::to_vec_pretty(&config).unwrap())
         .expect("failed to write replay config");
     path
+}
+
+fn read_trace_events(name: &str) -> Vec<TraceEvent> {
+    std::fs::read_to_string(fixture_path(name))
+        .expect("read generated trace")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("generated trace event is valid JSON"))
+        .collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -292,6 +304,34 @@ fn build_low_stake_blocklace() -> (Blocklace, HashMap<NodeId, u64>) {
     (b, bonds)
 }
 
+/// Four of seven equally weighted validators participate through four rounds.
+/// A simple majority accepts both ratification levels, while the protocol's
+/// strict two-thirds rule rejects them. This fixture is generated only by the
+/// deliberately mutated Rust build.
+#[cfg(feature = "trace-threshold-mutation")]
+fn build_weakened_threshold_blocklace() -> (Blocklace, HashMap<NodeId, u64>) {
+    let mut b = Blocklace::new();
+    let bonds: HashMap<NodeId, u64> = (1u8..=7).map(|id| (node(id), 100u64)).collect();
+    let voters = [1u8, 2, 3, 4];
+
+    let leader_block = make_block(1, 1, HashSet::new());
+    insert(&mut b, &leader_block);
+    let mut previous: HashSet<BlockIdentity> = [leader_block.identity].into();
+
+    for round in 1u8..=3 {
+        let blocks: Vec<Block> = voters
+            .iter()
+            .map(|creator| make_block(*creator, round * 10 + *creator, previous.clone()))
+            .collect();
+        for block in &blocks {
+            insert(&mut b, block);
+        }
+        previous = blocks.iter().map(|block| block.identity.clone()).collect();
+    }
+
+    (b, bonds)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Test entry points
 // ─────────────────────────────────────────────────────────────────────────────
@@ -408,6 +448,55 @@ fn generate_all_fixtures() {
     generate_normal_fixture();
     generate_equivocation_fixture();
     generate_low_stake_fixture();
+
+    // These are the safety-relevant events produced by the actual consensus
+    // calls above. The remaining transport/scheduler/lifecycle boundaries are
+    // asserted by `trace_runtime_instrumentation`.
+    let events: Vec<TraceEvent> = ["normal.json", "equivocation.json", "low_stake.json"]
+        .into_iter()
+        .flat_map(read_trace_events)
+        .collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TraceEvent::InsertBlock(_)))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TraceEvent::ValidateBlock(_)))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TraceEvent::DetectEquivocation(_)))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TraceEvent::AcceptApproval(_)))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TraceEvent::BuildThresholdCertificate(_)))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TraceEvent::ComputeFinality(_)))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TraceEvent::RunTauOrder(_)))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TraceEvent::EmitOutput(_)))
+    );
+
     let names = [
         "normal.json",
         "normal.weights.json",
@@ -434,4 +523,33 @@ fn generate_all_fixtures() {
 
     unsafe { std::env::remove_var("CORDIAL_TRACE_FILE") };
     println!("\n✓ All fixture traces are deterministic and written to lean/traces/");
+}
+
+/// Generate a trace using the actual Rust finality pipeline compiled with the
+/// deliberately weakened `2 * support > total` predicate. The surrounding
+/// shell harness feeds this trace to the unchanged Lean CMRef and requires a
+/// first-mismatch rejection.
+#[cfg(feature = "trace-threshold-mutation")]
+#[test]
+fn generate_weakened_threshold_fixture() {
+    let bonds: HashMap<NodeId, u64> = (1u8..=7).map(|id| (node(id), 100u64)).collect();
+    let path = prepare_fixture("weakened_threshold.json", &bonds, 4);
+    // SAFETY: this integration-test target is run with one test thread.
+    unsafe {
+        std::env::set_var("CORDIAL_TRACE_FILE", path.to_str().unwrap());
+    }
+
+    let (blocklace, _) = build_weakened_threshold_blocklace();
+    use cordial_miners_core::consensus::finality::latest_weighted_final_leader;
+    let mutated_result = latest_weighted_final_leader(&blocklace, 4, &bonds, leader);
+
+    unsafe { std::env::remove_var("CORDIAL_TRACE_FILE") };
+    assert!(
+        mutated_result.is_some(),
+        "the deliberately weakened Rust threshold must finalize four of seven validators"
+    );
+    println!(
+        "[mutation/weakened-threshold] actual Rust execution wrote {}",
+        path.display()
+    );
 }
