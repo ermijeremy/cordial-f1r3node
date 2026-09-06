@@ -7,14 +7,17 @@ Mirrors the Rust types:
   - `BlockContent`  → `BlockContent`  (types/content_id.rs)
   - `Block`         → `Block`         (block.rs)
 
-Hash injectivity is stated as an explicit axiom (`hashInj`), a trusted
-boundary, not something proved here. All acyclicity reasoning downstream
-depends on it.
+The cryptographic hash is abstracted by an executable injective encoding for
+the standalone formal examples.  Trace replay uses a compact injective
+interning table from Rust hash strings to `BlockId`; recursively encoding a
+whole predecessor DAG into a natural number is mathematically convenient but
+not an executable representation of a fixed-width cryptographic digest.
 
 Owned by Issue 02 (KR1 — Blocklace Core).
 -/
 
 import Mathlib.Data.Finset.Basic
+import Mathlib.Logic.Equiv.Finset
 
 namespace CordialMiners
 
@@ -38,47 +41,60 @@ abbrev BlockId := Nat
 is the set `P` of predecessor block identities.
 -/
 structure BlockContent where
-  payload      : List UInt8
+  payload      : List Nat
   predecessors : Finset BlockId
   deriving DecidableEq
 
+private def blockContentEquiv : BlockContent ≃ List Nat × Finset BlockId where
+  toFun content := (content.payload, content.predecessors)
+  invFun data := { payload := data.1, predecessors := data.2 }
+  left_inv _ := rfl
+  right_inv _ := rfl
+
+instance : Encodable BlockContent :=
+  Encodable.ofEquiv (List Nat × Finset BlockId) blockContentEquiv
+
 /-! ### Block Identity / Hash -/
 
-/-- Abstract hash function mapping creator identity and block content to a block identifier.
+/-- Executable injective abstraction of the signed content hash.
 
 Corresponds to paper §2.2: i = signedhash((v, P), k_p).
-Including creator NodeId ensures two distinct nodes creating identical content yield
-distinct block identifiers (matching Rust BlockIdentity).
+The concrete Rust digest remains an external identifier in the trace adapter;
+this encoding supplies the collision-free identifier used by the formal DAG.
 -/
-opaque hashContent : NodeId → BlockContent → BlockId
+def hashContent (creator : NodeId) (content : BlockContent) : BlockId :=
+  Encodable.encode (creator, content)
 
 /--
-Hash injectivity assumption.
-
-This is a trusted mathematical boundary: if two blocks have the same block ID,
-then their creator node IDs and block contents are equal.
-
-All downstream acyclicity reasoning relies on this assumption.
+Hash injectivity for the executable abstraction. Unlike a cryptographic
+collision-resistance assumption, this follows from `Encodable.encode`.
 -/
-axiom hashInj {n1 n2 : NodeId} {c1 c2 : BlockContent}
-    (h : hashContent n1 c1 = hashContent n2 c2) : n1 = n2 ∧ c1 = c2
+theorem hashInj {n1 n2 : NodeId} {c1 c2 : BlockContent}
+    (h : hashContent n1 c1 = hashContent n2 c2) : n1 = n2 ∧ c1 = c2 := by
+  have hp : (n1, c1) = (n2, c2) := Encodable.encode_injective h
+  exact ⟨congrArg Prod.fst hp, congrArg Prod.snd hp⟩
 
 /-! ### Block -/
 
 /--
 A single blocklace block.
 
-A block consists of:
-* an identifier
-* the node that created it
-* its content (payload and predecessors)
-* a well-formedness proof that its identifier is the signed hash of its creator and content
+`id` is opaque at the protocol-model layer.  Standalone examples may choose
+`hashContent creator content`; replay instead interns the externally verified
+Rust digest and rejects duplicate digest declarations.  The correspondence
+between a concrete digest and signed Rust content is therefore an explicit
+adapter/cryptography trust boundary, not an enormous recursively encoded Nat.
 -/
 structure Block where
   id        : BlockId
   creator   : NodeId
   content   : BlockContent
-  id_eq     : id = hashContent creator content
   deriving DecidableEq
+
+/-- Optional model-side condition for clients that construct identifiers with
+`hashContent`.  The DAG safety development itself needs only fresh opaque IDs,
+which is exactly the abstraction used for real cryptographic hashes. -/
+def HashFaithful (block : Block) : Prop :=
+  block.id = hashContent block.creator block.content
 
 end CordialMiners

@@ -303,22 +303,19 @@ def contentE2 : BlockContent := { payload := [1], predecessors := ∅ }
 def g : Block :=
   { id := hashContent honestId contentG
     creator := honestId
-    content := contentG
-    id_eq := rfl }
+    content := contentG }
 
 /-- The cheater's first block. -/
 def e1 : Block :=
   { id := hashContent cheaterId contentE1
     creator := cheaterId
-    content := contentE1
-    id_eq := rfl }
+    content := contentE1 }
 
 /-- The cheater's second, conflicting block. -/
 def e2 : Block :=
   { id := hashContent cheaterId contentE2
     creator := cheaterId
-    content := contentE2
-    id_eq := rfl }
+    content := contentE2 }
 
 /-- A real acknowledging block whose declared predecessors are both branches. -/
 def contentC : BlockContent :=
@@ -327,8 +324,7 @@ def contentC : BlockContent :=
 def c : Block :=
   { id := hashContent observerId contentC
     creator := observerId
-    content := contentC
-    id_eq := rfl }
+    content := contentC }
 
 theorem e1_ne_e2 : e1.id ≠ e2.id := by
   intro h

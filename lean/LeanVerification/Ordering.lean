@@ -12,13 +12,14 @@ sequence by:
 3. Emitting each epoch's approved blocks in deterministic topological
    order, excluding blocks already emitted by earlier recursion.
 
-Implementing `tau` concretely in Lean would require a decidable
-topological sort over an opaque `Blocklace`. Instead we declare `tau` as
-an `opaque` constant — the implementation lives in Rust; what matters
-formally is the **prefix-safety** property below.
+The earlier KR4 theorem surface keeps `tau` abstract below. Issue #188 adds
+the executable mirror in `CMRef.computeTau`: it evaluates the proved finite
+approval/ratification/finality predicates over the concrete `Blocklace` and
+runs a deterministic topological sort. Replay uses that Lean implementation,
+not the Rust result, as its exact ordering oracle.
 
-`tau_prefix_monotone` is stated as an `axiom` — a deliberate trusted
-formal boundary, in the same tradition as `hashInj` in `Block.lean`.
+`tau_prefix_monotone` remains stated as an `axiom` — a deliberate trusted
+formal boundary from the earlier KR4 work.
 It captures the append-only ledger invariant: as the blocklace grows,
 `tau` only extends its output list, never retracts.
 
@@ -265,8 +266,8 @@ theorem FinalLeader_of_subBlocklace
 /-- The deterministic ordered output of the protocol, anchored on the latest
 finalized leader and recursively expanded through all ratified ancestors.
 
-Declared `opaque` because its computational definition lives in Rust.
-What matters formally is `tau_prefix_monotone` below. -/
+Declared `opaque` on the KR4 theorem surface. The separate executable mirror
+used for trace conformance is `CMRef.computeTau`. -/
 opaque tau (bonds : NodeId → ℕ) (validators : Finset NodeId)
     (B : Blocklace) (hV : ValidBlocklace B)
     (wavelength : ℕ) (sel : ℕ → Option NodeId) : List BlockId
@@ -281,10 +282,11 @@ This is the property that makes the system usable as an append-only
 ledger — once a block is ordered by `tau`, it stays ordered at the same
 position in every future state.
 
-**Stated as an axiom** (a trusted formal boundary, analogous to `hashInj`
-in `Block.lean`) because proving it concretely requires implementing `tau`
-and the decidable topological sort, which are in Rust. The justification
-is the three-point proof sketch in the module doc.
+**Stated as an axiom** (the existing KR4 trust boundary) because the earlier
+issue did not prove the executable ordering implementation prefix-monotone.
+Issue #188 does not use this axiom to accept trace output; it recomputes the
+exact order through `CMRef.computeTau`. The justification for the abstract
+prefix statement is the three-point proof sketch in the module doc.
 
 Rust: the `tau` append-only invariant is tested by
 `test_finality.rs:finalized_order_excludes_equivocations_the_leader_acknowledged`. -/
