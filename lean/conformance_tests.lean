@@ -88,6 +88,14 @@ private def negativeTests (base : String) : IO Bool := do
       | .buildThresholdCertificate event => some (.buildThresholdCertificate
           { event with certificateId := "broken-certificate" })
       | _ => none
+    let duplicateApprover := mustReplace normalEvents fun
+      | .buildThresholdCertificate event => some (.buildThresholdCertificate
+          { event with approvers := event.approvers ++ event.approvers })
+      | _ => none
+    let duplicateEvidence := mustReplace normalEvents fun
+      | .buildThresholdCertificate event => some (.buildThresholdCertificate
+          { event with approverHashes := event.approverHashes ++ event.approverHashes })
+      | _ => none
     let falseEquivocation := mustReplace equivEvents fun
       | .detectEquivocation event => some (.detectEquivocation
           { event with equivocator := "01" })
@@ -119,6 +127,8 @@ private def negativeTests (base : String) : IO Bool := do
       expectFailure "invalid-finality" "finality mismatch" normalConfig invalidFinality,
       expectFailure "insufficient-quorum" "insufficient quorum" normalConfig insufficientQuorum,
       expectFailure "invalid-certificate" "certificate id mismatch" normalConfig invalidCertificate,
+      expectFailure "duplicate-approver" "certificate repeats an approver" normalConfig duplicateApprover,
+      expectFailure "duplicate-evidence" "certificate repeats an evidence block" normalConfig duplicateEvidence,
       expectFailure "false-equivocation" "belongs to" equivConfig falseEquivocation,
       expectFailure "missing-predecessor" "unknown block hash" normalConfig missingPredecessor,
       expectFailure "incorrect-tau" "tau order mismatch" normalConfig incorrectTau,

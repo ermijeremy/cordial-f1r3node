@@ -270,12 +270,14 @@ theorem checkFinal_iff (bonds : NodeId → ℕ) (validators : Finset NodeId)
 
 /-! ### Executable τ reference model
 
-This is the executable mirror of the algorithm specified in
+This independently implements the algorithm described informally in
 `Ordering.lean`: select the latest finalized leader, recursively include the
 latest earlier final leader ratified by it, then deterministically
 topologically sort the newly approved blocks. `key` is the canonical Rust
 block-hash encoding used only to break ties; every consensus predicate is
-decided over the formal `Blocklace` above. -/
+decided over the formal `Blocklace` above. The component predicates have
+soundness lemmas; the composite ordering algorithm does NOT yet have a
+refinement theorem to KR4's opaque `tau`. This remains an acceptance gap. -/
 
 private def insertByKey (key : BlockId → String) (value : BlockId) :
     List BlockId → List BlockId
@@ -340,8 +342,9 @@ private def tauFromLeader (bonds : NodeId → ℕ) (validators : Finset NodeId)
       let suffix ← topoOrder B key approved
       pure (orderPrefix ++ suffix)
 
-/-- Independently compute the canonical formal τ result through the same
-KR2/KR4 executable predicates used by finality replay. -/
+/-- Independently compute a canonical τ reference result through the same
+KR2/KR4 executable predicates used by finality replay. Equivalence to the
+abstract KR4 `tau` has not been proved. -/
 def computeTau (bonds : NodeId → ℕ) (validators : Finset NodeId)
     (B : Blocklace) (hV : ValidBlocklace B) (wavelength : Nat)
     (sel : Nat → Option NodeId) (domain : List BlockId)

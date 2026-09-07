@@ -445,6 +445,10 @@ fn generate_low_stake_fixture() {
 /// Convenience test that generates all three fixtures in one run.
 #[test]
 fn generate_all_fixtures() {
+    // SAFETY: this target's canonical generator runs on one test thread.
+    // Every runtime emission must succeed, not merely enough to satisfy the
+    // fixture's event-count assertions.
+    unsafe { std::env::set_var("CORDIAL_TRACE_STRICT", "1") };
     generate_normal_fixture();
     generate_equivocation_fixture();
     generate_low_stake_fixture();
@@ -522,6 +526,7 @@ fn generate_all_fixtures() {
     }
 
     unsafe { std::env::remove_var("CORDIAL_TRACE_FILE") };
+    unsafe { std::env::remove_var("CORDIAL_TRACE_STRICT") };
     println!("\n✓ All fixture traces are deterministic and written to lean/traces/");
 }
 
@@ -537,6 +542,7 @@ fn generate_weakened_threshold_fixture() {
     // SAFETY: this integration-test target is run with one test thread.
     unsafe {
         std::env::set_var("CORDIAL_TRACE_FILE", path.to_str().unwrap());
+        std::env::set_var("CORDIAL_TRACE_STRICT", "1");
     }
 
     let (blocklace, _) = build_weakened_threshold_blocklace();
@@ -544,6 +550,7 @@ fn generate_weakened_threshold_fixture() {
     let mutated_result = latest_weighted_final_leader(&blocklace, 4, &bonds, leader);
 
     unsafe { std::env::remove_var("CORDIAL_TRACE_FILE") };
+    unsafe { std::env::remove_var("CORDIAL_TRACE_STRICT") };
     assert!(
         mutated_result.is_some(),
         "the deliberately weakened Rust threshold must finalize four of seven validators"

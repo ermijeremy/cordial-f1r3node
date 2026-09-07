@@ -224,24 +224,47 @@ pub struct WaveTaskEvent {
 
 // Emission helpers: the public API used by consensus modules
 
-/// Serialize `event` to JSON and append it to `CORDIAL_TRACE_FILE` (or stderr).
-/// Write errors are silently ignored so a broken sink never aborts the node.
+/// Serialize and write one complete event, reporting serialization/open/write
+/// failures. This API exists only in trace-enabled builds.
 #[cfg(feature = "trace")]
-pub fn emit(event: TraceEvent) {
+pub fn try_emit(event: &TraceEvent) -> std::io::Result<()> {
     use std::fs::OpenOptions;
     use std::io::Write;
 
-    let line = match serde_json::to_string(&event) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-
-    if let Ok(path) = std::env::var("CORDIAL_TRACE_FILE") {
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(file, "{}", line);
-        }
+    let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
+    if let Some(path) = std::env::var_os("CORDIAL_TRACE_FILE") {
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        writeln!(file, "{line}")?;
+        file.flush()
     } else {
-        eprintln!("[TRACE] {}", line);
+        let mut stderr = std::io::stderr().lock();
+        writeln!(stderr, "[TRACE] {line}")?;
+        stderr.flush()
+    }
+}
+
+/// Best-effort production tracing; conformance runs set
+/// `CORDIAL_TRACE_STRICT=1` to fail immediately on a broken sink. An incomplete
+/// canonical execution must never be mistaken for a successful capture.
+#[cfg(feature = "trace")]
+pub fn emit(event: TraceEvent) {
+    let result = if std::env::var_os("CORDIAL_TRACE_FILE").is_none() {
+        // Preserve libtest's stderr capture in ordinary trace-enabled tests.
+        // Writing directly to stderr here would bypass capture and flood the
+        // test runner with every consensus event, even for passing tests.
+        serde_json::to_string(&event)
+            .map(|line| eprintln!("[TRACE] {line}"))
+            .map_err(std::io::Error::other)
+    } else {
+        try_emit(&event)
+    };
+    match result {
+        Err(error)
+            if std::env::var_os("CORDIAL_TRACE_STRICT").is_some_and(|value| value == "1") =>
+        {
+            panic!("TRACE EMISSION ERROR: {error}");
+        }
+        _ => {}
     }
 }
 
