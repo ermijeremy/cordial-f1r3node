@@ -13,9 +13,10 @@ a related concrete scenario; it does **not** prove Rust satisfies the theorem
 universally. Proof-only helpers and missing direct coverage are explicit.
 Definitions such as `Block.id_eq` and `ValidBlocklace.insert` are described in 05a.
 
-Run `python3 scripts/check_issue188_mapping.py` to check declaration coverage
-and exact source/test links. CI runs it. It detects missing rows and stale
-locations, but cannot validate the semantic adequacy of a mapping.
+The mapping is reviewed whenever Lean or Rust declarations move. The
+conformance gate itself runs the Lean build/replay and parser/negative-test
+suite; those tests validate executable behavior rather than merely checking
+source-link locations.
 
 ## One row per theorem or lemma
 

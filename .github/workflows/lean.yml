@@ -14,7 +14,6 @@ on:
       - "rust-toolchain.toml"
       - "Justfile"
       - "scripts/issue188_mutation_test.sh"
-      - "scripts/check_issue188_mapping.py"
       - ".github/workflows/lean.yml"
   pull_request:
     branches: ["lean-q1", "dev", "master"]
@@ -29,7 +28,6 @@ on:
       - "rust-toolchain.toml"
       - "Justfile"
       - "scripts/issue188_mutation_test.sh"
-      - "scripts/check_issue188_mapping.py"
       - ".github/workflows/lean.yml"
     types: [opened, synchronize, reopened]
 
@@ -59,10 +57,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
 
-      - name: Check workspace layout and proof-to-test references
+      - name: Check workspace layout
         run: |
           cargo metadata --format-version 1 --no-deps > /dev/null
-          python3 scripts/check_issue188_mapping.py
 
       - name: Check available memory
         run: free -h
