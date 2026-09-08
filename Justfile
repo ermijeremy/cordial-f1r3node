@@ -62,6 +62,7 @@ issue188-rust:
     cargo +{{toolchain}} test -j 2 -p cordial-miners-core --features trace --test generate_trace_fixtures generate_all_fixtures -- --exact --nocapture --test-threads=1
 
 issue188-lean:
+    python3 scripts/check_issue188_mapping.py
     cd lean && lake build replay_runner conformance_tests
     cd lean && lake exe replay_runner
     cd lean && lake exe conformance_tests

@@ -63,6 +63,10 @@ impl<V: CryptoVerifier> Node<V> {
         }
         // Insert into local blocklace
         {
+            // Validation and commit share one lock acquisition so the closure
+            // check cannot race a concurrent insertion. The lock is released
+            // before broadcasting, keeping network I/O outside the state
+            // critical section.
             let mut blocklace = self.blocklace.lock().await;
             blocklace.insert(block.clone(), &self.verifier)?;
         }

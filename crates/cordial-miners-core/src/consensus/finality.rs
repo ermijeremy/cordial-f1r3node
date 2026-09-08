@@ -116,7 +116,7 @@ where
         },
         certificate_id: None,
         output_prefix_hash: None,
-        weight_table_hash: "unweighted".into(),
+        weight_table_hash: None,
     }));
 
     result
@@ -279,7 +279,7 @@ where
             certificate_id: result
                 .then(|| trace::certificate_id("super_ratification", &block_hash, None)),
             output_prefix_hash: None,
-            weight_table_hash: trace::weight_table_hash(bonds),
+            weight_table_hash: Some(trace::weight_table_hash(bonds)),
         }));
     }
 
@@ -368,7 +368,7 @@ where
                 certificate_id: result
                     .then(|| trace::certificate_id("super_ratification", &block_hash, None)),
                 output_prefix_hash: None,
-                weight_table_hash: trace::weight_table_hash(bonds),
+                weight_table_hash: Some(trace::weight_table_hash(bonds)),
             }));
         }
         if result {

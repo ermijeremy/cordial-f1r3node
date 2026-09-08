@@ -21,7 +21,7 @@
 #![cfg(feature = "trace")]
 
 use cordial_miners_core::blocklace::Blocklace;
-use cordial_miners_core::consensus::cordiality::all_equivocations;
+use cordial_miners_core::consensus::cordiality::all_equivocations_for_observer;
 use cordial_miners_core::consensus::ordering::weighted_tau;
 use cordial_miners_core::consensus::validation::{ValidationConfig, validate_block};
 use cordial_miners_core::crypto::CryptoVerifier;
@@ -376,7 +376,9 @@ fn generate_equivocation_fixture() {
     let (blocklace, _) = build_equivocation_blocklace();
 
     // Trigger equivocation detection — emits DetectEquivocation events.
-    let equivocations = all_equivocations(&blocklace);
+    // Model node 01's local view explicitly: node_id is the observer and
+    // equivocation.creator is the validator that produced the conflicting blocks.
+    let equivocations = all_equivocations_for_observer(&blocklace, &node(1));
     use cordial_miners_core::consensus::finality::latest_weighted_final_leader;
     let final_leader = latest_weighted_final_leader(&blocklace, 3, &bonds, leader);
 

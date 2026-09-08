@@ -104,7 +104,7 @@ structure ComputeFinalityEvent where
   decision : String
   certificateId : Option String
   outputPrefixHash : Option String
-  weightTableHash : String
+  weightTableHash : Option String
   deriving Repr, DecidableEq
 
 structure RunTauOrderEvent where
@@ -285,7 +285,7 @@ private def parseEventJson (json : Json) : Except String TraceEvent := do
       pure (.computeFinality ⟨← field json "node_id", ← field json "wave",
         ← field json "wavelength", ← field json "block_hash", ← field json "decision",
         ← optionField json "certificate_id", ← optionField json "output_prefix_hash",
-        ← field json "weight_table_hash"⟩)
+        ← optionField json "weight_table_hash"⟩)
   | "run_tau_order" =>
       requireOnlyKeys json ["event", "node_id", "wave", "wavelength",
         "latest_leader_hash", "ordered_block_hashes", "output_len"]

@@ -2,11 +2,23 @@
 
 ## Reproducible pipeline
 
+Status: the executable replay gate exists; full Issue #188 acceptance remains
+blocked on the KR4 ordering refinement proof. A green run checks independent
+ordering comparison, not a theorem that `computeTau` implements opaque `tau`.
+
 Run the complete local gate from the repository root:
 
 ```bash
 just issue188-conformance
 ```
+
+The workspace also needs a sibling `../f1r3node` checkout, including for
+`cargo -p cordial-miners-core` (Cargo resolves all workspace manifests).
+CI checks out this repository into `blocklace/` and upstream
+`F1R3FLY-io/f1r3node` into `f1r3node/`, pinned to
+`3507ce3daab1946cdda2050a6dbeedd0f0898575` (`rust-v0.4.15`). It checks the
+layout with `cargo metadata --no-deps` before building. Lean action paths,
+cache paths, and shell working directories use this same layout.
 
 The gate executes these stages sequentially:
 
@@ -40,6 +52,11 @@ plus their weight/leader sidecars. It immediately performs the same executions
 a second time and compares all six files byte-for-byte. Set-valued fields are
 sorted before serialization; ids and prefix hashes are deterministic; no wall
 clock value is part of the semantic trace.
+
+Both canonical and mutation generators enable `CORDIAL_TRACE_STRICT=1`.
+Serialization/open/write/flush failures abort capture immediately; event-count
+checks are not relied on to detect a partially written trace. Production
+best-effort behavior is unchanged when strict mode is not enabled.
 
 CI then runs `git diff --exit-code -- lean/traces`. A consensus or schema
 change must therefore either preserve the canonical execution exactly or be
@@ -83,6 +100,7 @@ was finalized.
 - an incorrect finality decision;
 - insufficient weighted quorum;
 - an invalid certificate id/evidence;
+- duplicate certificate approvers or evidence blocks;
 - a false equivocation report;
 - an incorrect tau order;
 - an incorrect output-prefix hash; and
@@ -109,6 +127,9 @@ accepts it, or if rejection occurs for an unrelated reason.
 ## CI behavior
 
 `.github/workflows/lean.yml` runs on relevant pushes and pull requests. It:
+
+0. checks the pinned sibling dependency layout and all 117 named KR theorem/
+   lemma mapping rows, including exact Rust source and test links;
 
 1. builds and tests the default, non-tracing core;
 2. tests the trace-enabled core, including runtime instrumentation coverage;
@@ -160,6 +181,10 @@ or deriving the expected answer from the trace's result field.
 
 | Date | Observation | Classification | Resolution |
 |---|---|---|---|
+| 2026-09-07 | `computeTau` was called a refinement despite no theorem relating it to opaque `tau`; the formal signature omits canonical tie-break keys and the replay horizon. | Lean-spec problem | **OPEN / PR blocker.** Removed unsupported refinement/proof-sketch claims. Complete the KR4 ordering specification and prove executable correspondence; no replacement axiom added. |
+| 2026-09-07 | Conformance CI checked out only this repository although Cargo resolves sibling `f1r3node` workspace path dependencies. | CI setup bug | Added a pinned sibling checkout and corrected all Lean/cache/working-directory paths. Hosted execution still requires a real CI run. |
+| 2026-09-07 | Runtime trace emission silently discarded file-open/write errors. | trace instrumentation bug | Added fallible `try_emit`, opt-in strict emission, mandatory strict fixture capture, and subprocess tests for open and write failures. |
+| 2026-09-07 | Mapping grouped declarations, referenced wildcard tests and nonexistent negative labels, and misidentified an output emission boundary. | documentation/test coverage bug | Added one row per named KR theorem/lemma, exact checked links, explicit proof-only coverage, correct negative labels, and actual duplicate-member/evidence negative tests. |
 | 2026-09-07 | Set-valued parent/evidence fields could follow randomized `HashSet` traversal. | trace determinism bug | Centralized sorted hash/member encoding and made fixture generation compare two complete executions byte-for-byte. |
 | 2026-09-07 | The former string-search parser could collapse `null` and missing numeric fields to defaults. | trace/schema adapter bug | Replaced it with Lean's JSON parser, strict field/type checks, and `Option Nat`; added malformed/unknown/missing/wrong-type/extra-field tests. |
 | 2026-09-07 | A proposed mutation check only flipped a parsed finality result, so it did not prove CI caught broken Rust code. | test-oracle bug | Added opt-in compilation of the actual weaker Rust predicate and an ephemeral execution harness; Lean rejects its first bad certificate at support 400/700. |

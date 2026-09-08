@@ -9,14 +9,11 @@ rev = "v4.33.0"
 
 [[lean_lib]]
 name = "LeanVerification"
-moreLeanArgs = ["-j", "2"]
 
 [[lean_exe]]
 name = "replay_runner"
 root = "replay_runner"
-moreLeanArgs = ["-j", "2"]
 
 [[lean_exe]]
 name = "conformance_tests"
 root = "conformance_tests"
-moreLeanArgs = ["-j", "2"]

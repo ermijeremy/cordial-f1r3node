@@ -88,6 +88,11 @@ pub enum TraceEvent {
 // Per-event payload structs
 
 /// Shared fields for block-lifecycle events (Create / Insert / Buffer).
+///
+/// `node_id` is the node/context performing the lifecycle action. `creator` is
+/// always the author of the block and may differ from the actor. The generic
+/// `Blocklace` commit path has no observer parameter and therefore uses the
+/// creator as its commit actor; node-owned paths provide the local node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockLifecycleEvent {
     pub node_id: String,
@@ -139,6 +144,8 @@ pub struct DetectEquivocationEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcceptApprovalEvent {
+    /// Node evaluating/accepting this approval. It is normally the approver
+    /// because the current approval API has no separate observer parameter.
     pub node_id: String,
     pub wave: Option<u64>,
     pub round: u64,
@@ -176,7 +183,9 @@ pub struct ComputeFinalityEvent {
     pub decision: String,
     pub certificate_id: Option<String>,
     pub output_prefix_hash: Option<String>,
-    pub weight_table_hash: String,
+    /// `Some` for stake-weighted finality; `None` for paper-native unweighted
+    /// finality, which has no validator weight-table context.
+    pub weight_table_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -433,7 +442,7 @@ mod tests {
                 decision: "finalized".into(),
                 certificate_id: Some("cert01".into()),
                 output_prefix_hash: Some("ffee".into()),
-                weight_table_hash: "weights01".into(),
+                weight_table_hash: Some("weights01".into()),
             }),
             TraceEvent::RunTauOrder(TauOrderEvent {
                 node_id: "v1".into(),

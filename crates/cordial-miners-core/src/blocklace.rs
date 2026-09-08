@@ -70,6 +70,10 @@ impl Blocklace {
         let inserted_id = id.clone();
         self.blocks.insert(id, content);
         self.generation += 1;
+        // This low-level commit API has no local-node, wave, or validator-table
+        // context. The block creator is therefore the commit actor; absent
+        // protocol context is represented as JSON null rather than fabricated
+        // defaults.
         #[cfg(feature = "trace")]
         trace::emit(TraceEvent::InsertBlock(BlockLifecycleEvent {
             node_id: creator.clone(),
@@ -189,6 +193,8 @@ impl Blocklace {
         if !missing.is_empty() {
             #[cfg(feature = "trace")]
             {
+                // A generic Blocklace has no wavelength or bond table, so
+                // wave and weight_table_hash remain explicitly unavailable.
                 let round = candidate_depth(self, &block.content);
                 trace::emit(TraceEvent::BufferBlock(BlockLifecycleEvent {
                     node_id: trace::hex(&block.identity.creator.0),

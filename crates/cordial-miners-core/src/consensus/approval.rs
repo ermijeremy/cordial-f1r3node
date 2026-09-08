@@ -156,10 +156,18 @@ pub(crate) fn weighted_approving_creators_with_memo(
     bonds: &HashMap<NodeId, u64>,
     memo: &mut ApprovalMemo,
 ) -> HashSet<NodeId> {
-    // Approval checks emit trace evidence.  Never let HashSet's randomized
-    // iteration order leak into the canonical event stream.
-    let mut ordered_blocks: Vec<_> = blocks.iter().collect();
-    ordered_blocks.sort_by_key(|block| block.identity.clone());
+    // Approval checks emit trace evidence. Never let HashSet's randomized
+    // iteration order leak into the canonical event stream. The returned value
+    // is a HashSet, so this ordering changes only trace record order, not the
+    // approval result or its weighted support.
+    #[cfg(feature = "trace")]
+    let ordered_blocks = {
+        let mut blocks = blocks.iter().collect::<Vec<_>>();
+        blocks.sort_by_key(|block| block.identity.clone());
+        blocks
+    };
+    #[cfg(not(feature = "trace"))]
+    let ordered_blocks: Vec<_> = blocks.iter().collect();
     ordered_blocks
         .into_iter()
         .filter(|block| approves_with_memo(blocklace, &block.identity, target, memo))

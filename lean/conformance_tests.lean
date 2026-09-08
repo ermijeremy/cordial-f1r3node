@@ -63,11 +63,15 @@ private def parserTests (base : String) : IO Bool := do
       "{\"event\":\"scheduler_tick\",\"node_id\":\"quoted\\\"node\",\"tick\":1,\"wave\":null}" with
     | .ok (.schedulerTick event) => event.nodeId == "quoted\"node"
     | _ => false
+  let nullWeight := match parseLine
+      "{\"event\":\"compute_finality\",\"node_id\":\"n\",\"wave\":0,\"wavelength\":3,\"block_hash\":\"b\",\"decision\":\"not_finalized\",\"certificate_id\":null,\"output_prefix_hash\":null,\"weight_table_hash\":null}" with
+    | .ok (.computeFinality event) => event.weightTableHash.isNone
+    | _ => false
   let blank := isError (parseLine "")
-  let ok := coverageOk && malformed && unknown && missing && wrongType && extra && escaped && blank
+  let ok := coverageOk && malformed && unknown && missing && wrongType && extra && escaped && nullWeight && blank
   IO.println s!"[parser/all-15-and-errors] {if ok then "PASS ✓" else "FAIL"}"
   if !ok then
-    IO.println s!"  coverage={coverageOk}, malformed={malformed}, unknown={unknown}, missing={missing}, wrongType={wrongType}, extra={extra}, escaped={escaped}, blank={blank}, schema={reprStr schema}"
+    IO.println s!"  coverage={coverageOk}, malformed={malformed}, unknown={unknown}, missing={missing}, wrongType={wrongType}, extra={extra}, escaped={escaped}, nullWeight={nullWeight}, blank={blank}, schema={reprStr schema}"
   pure ok
 
 private def negativeTests (base : String) : IO Bool := do

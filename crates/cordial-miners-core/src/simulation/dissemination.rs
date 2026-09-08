@@ -51,8 +51,6 @@ pub struct SimNode {
     pub evidence: CordialEvidencePool,
     bonds: HashMap<NodeId, u64>,
     validation_config: ValidationConfig,
-    #[cfg(feature = "trace")]
-    pending_missing: HashMap<BlockIdentity, std::collections::HashSet<BlockIdentity>>,
 }
 
 impl SimNode {
@@ -83,8 +81,6 @@ impl SimNode {
             evidence: CordialEvidencePool::new(),
             bonds,
             validation_config,
-            #[cfg(feature = "trace")]
-            pending_missing: HashMap::new(),
         }
     }
 
@@ -111,15 +107,15 @@ impl SimNode {
                     .iter()
                     .all(|error| matches!(error, InvalidBlock::MissingPredecessors { .. }))
                 {
+                    let missing: std::collections::HashSet<_> = block
+                        .content
+                        .predecessors
+                        .iter()
+                        .filter(|parent| self.blocklace.content(parent).is_none())
+                        .cloned()
+                        .collect();
                     #[cfg(feature = "trace")]
                     {
-                        let missing: std::collections::HashSet<_> = block
-                            .content
-                            .predecessors
-                            .iter()
-                            .filter(|parent| self.blocklace.content(parent).is_none())
-                            .cloned()
-                            .collect();
                         trace::emit(TraceEvent::BufferBlock(BlockLifecycleEvent {
                             node_id: trace::hex(&self.id.0),
                             wave: None,
@@ -130,9 +126,9 @@ impl SimNode {
                             creator: trace::hex(&block.identity.creator.0),
                             weight_table_hash: Some(trace::weight_table_hash(&self.bonds)),
                         }));
-                        self.pending_missing.insert(block.identity.clone(), missing);
                     }
-                    self.pending.buffer_block_with_missing_predecessors(block);
+                    self.pending
+                        .buffer_block_with_missing_predecessors_known(block, missing);
                     DeliveryOutcome::Buffered
                 } else {
                     DeliveryOutcome::Rejected(errors)
@@ -148,23 +144,18 @@ impl SimNode {
     /// rejection happens — so proof is captured here too, exactly as in
     /// `receive_block`, before the rejected block is dropped.
     pub fn retry_buffered_blocks(&mut self) {
+        let resolved = self.pending.take_resolved_predecessors(&self.blocklace);
+        #[cfg(not(feature = "trace"))]
+        let _ = resolved;
         #[cfg(feature = "trace")]
-        for (block_id, missing) in &mut self.pending_missing {
-            let resolved: Vec<_> = missing
-                .iter()
-                .filter(|parent| self.blocklace.content(parent).is_some())
-                .cloned()
-                .collect();
-            for parent in &resolved {
-                trace::emit(TraceEvent::ResolveMissingParent(
-                    ResolveMissingParentEvent {
-                        node_id: trace::hex(&self.id.0),
-                        block_hash: trace::hex(&block_id.content_hash),
-                        resolved_parent_hash: trace::hex(&parent.content_hash),
-                    },
-                ));
-                missing.remove(parent);
-            }
+        for (block_id, parent) in resolved {
+            trace::emit(TraceEvent::ResolveMissingParent(
+                ResolveMissingParentEvent {
+                    node_id: trace::hex(&self.id.0),
+                    block_hash: trace::hex(&block_id.content_hash),
+                    resolved_parent_hash: trace::hex(&parent.content_hash),
+                },
+            ));
         }
         let rejected = self.pending.retry_buffered_blocks(
             &mut self.blocklace,
@@ -174,9 +165,6 @@ impl SimNode {
         for (block, errors) in rejected {
             record_rejected_equivocation(&block, &errors, &self.blocklace, &mut self.evidence);
         }
-        #[cfg(feature = "trace")]
-        self.pending_missing
-            .retain(|block, _| self.pending.buffered_blocks.contains_key(block));
     }
 
     pub fn knows_block(&self, id: &BlockIdentity) -> bool {

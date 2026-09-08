@@ -223,13 +223,14 @@ structure ReplayState where
   tauChecks : Nat
   outputChecks : Nat
   lastTau : Option (Nat × List String)
+  lastSchedulerTick : Option Nat
   emitted : List String
 
 def ReplayState.empty (config : ReplayConfig) : ReplayState :=
   { config, dag := ReplayDag.empty, approvals := [], checkedApprovalPairs := [],
     certificates := [], buffered := [], equivocationChecks := 0,
     finalityChecks := 0, finalityDecisions := [], tauChecks := 0,
-    outputChecks := 0, lastTau := none, emitted := [] }
+    outputChecks := 0, lastTau := none, lastSchedulerTick := none, emitted := [] }
 
 private def requireKnownBlock (state : ReplayState) (hash : String) : Except String ReplayedBlock :=
   match state.dag.findHash? hash with
@@ -374,7 +375,16 @@ private def checkEquivocationEvent (state : ReplayState)
   for other in blocks.drop 1 do
     if !CMRef.checkEquivocation state.dag.blocklace state.dag.valid
         first.formalId other.formalId then
-      throw s!"Lean KR2 equivocation predicate rejects {first.rustHash} vs {other.rustHash}"
+        throw s!"Lean KR2 equivocation predicate rejects {first.rustHash} vs {other.rustHash}"
+
+private def checkPackageEvent (nodeId peerId : String) (hashes : List String)
+    (kind : String) : Except String Unit := do
+  if nodeId.isEmpty then throw s!"{kind} has an empty node_id"
+  if peerId.isEmpty then throw s!"{kind} has an empty peer_id"
+  if hashes.isEmpty then throw s!"{kind} has no blocks"
+  if !uniqueStrings hashes then throw s!"{kind} repeats a block hash"
+  for hash in hashes do
+    if hash.isEmpty then throw s!"{kind} contains an empty block hash"
 
 private def computeTau (state : ReplayState) (wave : Nat) : Except String (ReplayedBlock × List String) := do
   let key := fun id => (state.dag.findFormal? id).map ReplayedBlock.rustHash |>.getD ""
@@ -389,7 +399,25 @@ private def computeTau (state : ReplayState) (wave : Nat) : Except String (Repla
     | none => throw "CMRef tau returned an unknown block"
   pure (latest, order)
 
+private def eventNodeId : TraceEvent → String
+  | .createBlock event => event.nodeId
+  | .validateBlock event => event.nodeId
+  | .insertBlock event => event.nodeId
+  | .bufferBlock event => event.nodeId
+  | .resolveMissingParent event => event.nodeId
+  | .detectEquivocation event => event.nodeId
+  | .acceptApproval event => event.nodeId
+  | .buildThresholdCertificate event => event.nodeId
+  | .computeFinality event => event.nodeId
+  | .runTauOrder event => event.nodeId
+  | .emitOutput event => event.nodeId
+  | .sendPackage event => event.nodeId
+  | .deliverPackage event => event.nodeId
+  | .schedulerTick event => event.nodeId
+  | .runWaveTask event => event.nodeId
+
 private def checkEvent (state : ReplayState) (event : TraceEvent) : Except String ReplayState := do
+  if (eventNodeId event).isEmpty then throw "event has an empty node_id"
   match event with
   | .createBlock event =>
       if !event.missingParentHashes.isEmpty then throw "created block has missing parents"
@@ -461,7 +489,7 @@ private def checkEvent (state : ReplayState) (event : TraceEvent) : Except Strin
       checkCertificateEvent state event
       pure { state with certificates := state.certificates ++ [event] }
   | .computeFinality event =>
-      checkWeightHash state event.weightTableHash
+      checkOptionalWeightHash state event.weightTableHash
       if event.wavelength != state.config.wavelength then
         throw s!"wavelength mismatch: Rust={event.wavelength}, config={state.config.wavelength}"
       let candidate ← requireKnownBlock state event.blockHash
@@ -531,13 +559,23 @@ private def checkEvent (state : ReplayState) (event : TraceEvent) : Except Strin
         throw s!"output prefix hash mismatch at {event.outputIndex}: Rust={event.outputPrefixHash}, Lean={expectedPrefixHash}"
       pure { state with emitted := outputPrefix, outputChecks := state.outputChecks + 1 }
   | .sendPackage event =>
-      if event.blockHashes.isEmpty then throw "send_package has no blocks"
+      checkPackageEvent event.nodeId event.peerId event.blockHashes "send_package"
       pure state
   | .deliverPackage event =>
-      if event.blockHashes.isEmpty then throw "deliver_package has no blocks"
+      checkPackageEvent event.nodeId event.peerId event.blockHashes "deliver_package"
       pure state
-  | .schedulerTick _ => pure state
+  | .schedulerTick event =>
+      if event.nodeId.isEmpty then throw "scheduler_tick has an empty node_id"
+      match state.lastSchedulerTick with
+      | some previous =>
+          if event.tick < previous then
+            throw s!"scheduler tick moved backwards: previous={previous}, current={event.tick}"
+      | none => pure ()
+      pure { state with lastSchedulerTick := some event.tick }
   | .runWaveTask event =>
+      if event.nodeId.isEmpty then throw "run_wave_task has an empty node_id"
+      if state.config.leader event.wave |>.isNone then
+        throw s!"run_wave_task names unknown wave {event.wave}"
       if !(["propose", "vote", "finalize"].contains event.task) then
         throw s!"unknown wave task '{event.task}'"
       pure state

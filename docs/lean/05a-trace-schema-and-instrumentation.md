@@ -12,6 +12,14 @@ With the feature enabled, `CORDIAL_TRACE_FILE` selects an append-only file;
 otherwise events go to stderr. The fixture generator truncates each target
 before executing its scenario.
 
+Production tracing remains best-effort. Canonical generators explicitly set
+`CORDIAL_TRACE_STRICT=1`: any serialization, file-open, write, or flush failure
+panics with `TRACE EMISSION ERROR` and fails generation. Trace-enabled callers
+can also use `trace::try_emit` to handle its `io::Result` directly. Tests
+`trace_sink_open_failure_is_fatal_only_in_strict_mode` and (Linux)
+`trace_sink_write_failure_is_fatal_only_in_strict_mode` exercise both policies
+in isolated subprocesses. Strict mode does not claim crash-durable storage.
+
 ## Canonical encoding rules
 
 - Every record is exactly one JSON object with an `event` tag. A final line
@@ -22,6 +30,21 @@ before executing its scenario.
   as null. Lean represents them as `Option`.
 - Block, parent, approver, and output arrays preserve all schema data. Set-valued
   Rust inputs are sorted before emission.
+- `node_id` is the event actor/context, not a universal synonym for block
+  creator: it is the local node for create/validate/insert/buffer/resolve,
+  the observer for `detect_equivocation`, the approver/ratifier for approval
+  and certificate evaluation, the evaluator for finality/order/output, the
+  sender for `send_package`, and the recipient for `deliver_package`. The
+  generic `Blocklace` commit API has no observer parameter, so its insert event
+  uses the block creator as the commit actor; node-owned paths provide the local
+  node directly. Subject fields (`creator`, `approver`, `equivocator`, `peer_id`)
+  retain the other identities. Generic blocklace queries with no observer
+  context do not emit a detection event; use `all_equivocations_for_observer`
+  when a local node is known.
+- `None` is intentional when an event has no corresponding protocol context:
+  lifecycle events do not invent a wave or weight-table hash, and unweighted
+  finality has no weight-table hash. Weighted certificate/finality events carry
+  `Some`/a required hash and Lean verifies it.
 - `scheduler_tick.tick` is a deterministic logical step, never wall-clock time.
 - Weight-table, certificate, and output-prefix fingerprints use FNV-1a-64 with
   the encodings documented in `crates/cordial-miners-core/src/trace.rs`.
@@ -35,10 +58,10 @@ before executing its scenario.
 | `insert_block` | all lifecycle fields | `Blocklace::commit_validated`, shared by both insertion APIs |
 | `buffer_block` | all lifecycle fields, complete `missing_parent_hashes` | closure failure and `SimNode::receive_block` |
 | `resolve_missing_parent` | `node_id`, `block_hash`, `resolved_parent_hash` | `SimNode::retry_buffered_blocks` |
-| `detect_equivocation` | `node_id`, `equivocator`, `round`, `conflicting_block_hashes` | `consensus::cordiality::all_equivocations` |
+| `detect_equivocation` | `node_id` (observer), `equivocator`, `round`, `conflicting_block_hashes` | `consensus::cordiality::all_equivocations_for_observer` |
 | `accept_approval` | `node_id`, `wave?`, `round`, `approver`, `approver_hash`, `target_hash` | memoized approval evaluation |
 | `build_threshold_certificate` | `node_id`, `wave?`, `kind`, `leader_hash`, `ratifier_hash?`, `certificate_id`, `approver_hashes`, `approvers`, `approver_count`, `approver_weight`, `total_weight`, `weight_table_hash` | weighted ratification and super-ratification |
-| `compute_finality` | `node_id`, `wave`, `wavelength`, `block_hash`, `decision`, `certificate_id?`, `output_prefix_hash?`, `weight_table_hash` | weighted and unweighted final-leader evaluation |
+| `compute_finality` | `node_id`, `wave`, `wavelength`, `block_hash`, `decision`, `certificate_id?`, `output_prefix_hash?`, `weight_table_hash?` | weighted and unweighted final-leader evaluation |
 | `run_tau_order` | `node_id`, `wave`, `wavelength`, `latest_leader_hash`, `ordered_block_hashes`, `output_len` | weighted and unweighted `tau` |
 | `emit_output` | `node_id`, `wave`, `block_hash`, `output_index`, `output_prefix_hash` | each `tau` output item |
 | `send_package` | `node_id`, `peer_id`, `block_hashes` | network node and adversarial simulator send paths |
@@ -59,7 +82,28 @@ it is never replaced with zero. `BufferBlock` records every currently missing
 parent. Each later `ResolveMissingParent` removes exactly one member, and an
 `InsertBlock` is accepted only after the set is empty. Replay rejects dangling,
 duplicate, or unknown predecessors and preserves a proof of `ValidBlocklace`
-after every insertion.
+after every insertion. The simulator's `PendingBlockBuffer` owns this missing
+parent set; tracing reads it instead of maintaining a second trace-only map.
+
+`Node::create_block` and `Node::receive_block` hold the local blocklace mutex
+only across validation and insertion. That makes the check-and-commit operation
+atomic with respect to concurrent handlers; the lock is released before network
+I/O, so tracing does not change the network critical section.
+
+`scheduler_tick` records the adversarial simulator's logical clock advancing.
+`run_wave_task` records a node's protocol task (`propose`, `vote`, or
+`finalize`) at a wave. A scheduler tick is a clock event; a wave task is a
+node-level consensus action. They are intentionally separate event types.
+
+Replay treats transport and scheduler records as structural evidence rather
+than consensus predicates: it rejects empty actors/peers/hashes, duplicate
+hashes within a package, unknown wave tasks, and scheduler clocks that move
+backwards. It does not require a `deliver_package` to have a matching
+`send_package`, because a receiver may observe traffic generated outside the
+captured process (or through a transport boundary whose sender is represented
+by an address). KR1--KR4 decisions remain independently recomputed from the
+reconstructed blocklace; these basic checks prevent malformed transport data
+from being silently accepted without pretending to model the network stack.
 
 ## Weight configuration
 
@@ -166,3 +210,8 @@ documented KR4 prefix-safety trust boundary. Issue #188 replay does not use that
 axiom as an oracle: `CMRef.computeTau` executes leader/finality/ratification/
 approval selection and topological ordering over the reconstructed formal DAG,
 then compares its exact result to Rust.
+
+This comparison is **not a proved refinement of the opaque formal `tau`**.
+There is no equation specifying that function, nor a theorem connecting it to
+`computeTau`. This is an unresolved KR4 prerequisite, not an accepted substitute
+for Issue #188's ordering soundness requirement. See 05b and the triage log.

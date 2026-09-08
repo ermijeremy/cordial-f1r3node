@@ -75,7 +75,33 @@ pub fn equivocation_blocks_at_round(
 }
 
 /// Return every same-round equivocation currently present in the blocklace.
+///
+/// This pure query has no observer identity, so it does not emit a trace event.
+/// Call [`all_equivocations_for_observer`] from a node-owned execution path when
+/// a real local observer is available.
 pub fn all_equivocations(blocklace: &Blocklace) -> Vec<Equivocation> {
+    all_equivocations_with_observer(blocklace, None)
+}
+
+/// Return equivocations and emit detection events attributed to `observer`.
+///
+/// `node_id` in a detection event is the node observing the fork; the
+/// `equivocator` field remains the validator that produced the conflicting
+/// blocks. Keeping the observer explicit prevents the two identities from being
+/// silently conflated at generic blocklace-query call sites.
+pub fn all_equivocations_for_observer(
+    blocklace: &Blocklace,
+    observer: &NodeId,
+) -> Vec<Equivocation> {
+    all_equivocations_with_observer(blocklace, Some(observer))
+}
+
+fn all_equivocations_with_observer(
+    blocklace: &Blocklace,
+    observer: Option<&NodeId>,
+) -> Vec<Equivocation> {
+    #[cfg(not(feature = "trace"))]
+    let _ = observer;
     let Some(max_round) = blocklace
         .dom()
         .into_iter()
@@ -94,28 +120,35 @@ pub fn all_equivocations(blocklace: &Blocklace) -> Vec<Equivocation> {
 
     for creator in creators {
         for round in 0..=max_round {
-            let mut blocks: Vec<BlockIdentity> =
+            #[cfg(feature = "trace")]
+            let blocks: Vec<BlockIdentity> = {
+                let mut blocks = equivocation_blocks_at_round(blocklace, &creator, round)
+                    .into_iter()
+                    .map(|b| b.identity)
+                    .collect::<Vec<_>>();
+                blocks.sort();
+                blocks
+            };
+            #[cfg(not(feature = "trace"))]
+            let blocks: Vec<BlockIdentity> =
                 equivocation_blocks_at_round(blocklace, &creator, round)
                     .into_iter()
                     .map(|b| b.identity)
                     .collect();
 
             if blocks.len() >= 2 {
-                blocks.sort();
-
                 #[cfg(feature = "trace")]
-                trace::emit(TraceEvent::DetectEquivocation(DetectEquivocationEvent {
-                    // "node_id" here is the observer (the local node that
-                    // detected it). We use the equivocator's id as a proxy
-                    // since we have no local-node context at this call site.
-                    node_id: trace::hex(&creator.0),
-                    equivocator: trace::hex(&creator.0),
-                    round,
-                    conflicting_block_hashes: blocks
-                        .iter()
-                        .map(|id| trace::hex(&id.content_hash))
-                        .collect(),
-                }));
+                if let Some(observer) = observer {
+                    trace::emit(TraceEvent::DetectEquivocation(DetectEquivocationEvent {
+                        node_id: trace::hex(&observer.0),
+                        equivocator: trace::hex(&creator.0),
+                        round,
+                        conflicting_block_hashes: blocks
+                            .iter()
+                            .map(|id| trace::hex(&id.content_hash))
+                            .collect(),
+                    }));
+                }
 
                 equivocations.push(Equivocation {
                     creator: creator.clone(),
@@ -259,8 +292,14 @@ pub fn super_ratifies(
     n: usize,
     f: usize,
 ) -> bool {
-    let mut ordered_blocks: Vec<_> = blocks.iter().collect();
-    ordered_blocks.sort_by_key(|block| block.identity.clone());
+    #[cfg(feature = "trace")]
+    let ordered_blocks = {
+        let mut blocks = blocks.iter().collect::<Vec<_>>();
+        blocks.sort_by_key(|block| block.identity.clone());
+        blocks
+    };
+    #[cfg(not(feature = "trace"))]
+    let ordered_blocks: Vec<_> = blocks.iter().collect();
     let ratifying_blocks: HashSet<Block> = ordered_blocks
         .into_iter()
         .filter(|b| ratifies(blocklace, b, target, n, f))
@@ -409,8 +448,14 @@ fn weighted_super_ratifies_with_memo(
     // Ratification recursively emits approvals and certificates.  Evaluate
     // witnesses in identity order so equivalent executions have byte-stable
     // traces despite HashSet's randomized iteration order.
-    let mut ordered_blocks: Vec<_> = blocks.iter().collect();
-    ordered_blocks.sort_by_key(|block| block.identity.clone());
+    #[cfg(feature = "trace")]
+    let ordered_blocks = {
+        let mut blocks = blocks.iter().collect::<Vec<_>>();
+        blocks.sort_by_key(|block| block.identity.clone());
+        blocks
+    };
+    #[cfg(not(feature = "trace"))]
+    let ordered_blocks: Vec<_> = blocks.iter().collect();
     let ratifying_blocks: Vec<&Block> = ordered_blocks
         .into_iter()
         .filter(|block| weighted_ratifies_with_memo(blocklace, block, target, bonds, memo))
