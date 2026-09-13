@@ -9,7 +9,7 @@ cd "$repo_root"
 CORDIAL_TRACE_DIR="$benchmark_dir" \
   cargo test -j 2 -p cordial-miners-core --features trace \
     --test generate_trace_fixtures generate_benchmark_15_fixture -- \
-    --exact --nocapture --test-threads=1
+    --exact --ignored --nocapture --test-threads=1
 
 trace="$benchmark_dir/benchmark_15.json"
 weights="$benchmark_dir/benchmark_15.weights.json"
