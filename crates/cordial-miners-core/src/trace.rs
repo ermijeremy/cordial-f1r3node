@@ -8,6 +8,50 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "trace")]
+use std::{
+    io::{BufWriter, Write},
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+};
+
+#[cfg(feature = "trace")]
+type FileTraceSink = (PathBuf, BufWriter<std::fs::File>);
+
+/// The canonical sink is process-global so tracing does not reopen and
+/// reconfigure the file for every event.  The path is allowed to change in
+/// isolated fixture tests; the old writer is flushed before it is replaced.
+#[cfg(feature = "trace")]
+static FILE_TRACE_SINK: OnceLock<Mutex<Option<FileTraceSink>>> = OnceLock::new();
+
+#[cfg(feature = "trace")]
+fn write_file_record(path: &Path, record: &str) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+
+    let sink = FILE_TRACE_SINK.get_or_init(|| Mutex::new(None));
+    let mut sink = sink
+        .lock()
+        .map_err(|_| std::io::Error::other("trace sink mutex poisoned"))?;
+    let reopen = sink
+        .as_ref()
+        .map(|(current, _)| current != path)
+        .unwrap_or(true);
+    if reopen {
+        if let Some((_, writer)) = sink.as_mut() {
+            writer.flush()?;
+        }
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        *sink = Some((path.to_path_buf(), BufWriter::new(file)));
+    }
+    let Some((_, writer)) = sink.as_mut() else {
+        return Err(std::io::Error::other("trace sink was not initialized"));
+    };
+    writer.write_all(record.as_bytes())?;
+    // Keep try_emit's historical immediate-error behavior while avoiding the
+    // much more expensive open/reopen cycle for every record.
+    writer.flush()
+}
+
 // Internally tagged enums are deserialized through Serde's intermediate
 // `Content` value, whose default u128 entry point rejects JSON numbers even
 // when they fit in u64.  Decode through `deserialize_any` so certificate
@@ -237,17 +281,13 @@ pub struct WaveTaskEvent {
 /// failures. This API exists only in trace-enabled builds.
 #[cfg(feature = "trace")]
 pub fn try_emit(event: &TraceEvent) -> std::io::Result<()> {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
-    let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
+    let mut line = serde_json::to_string(event).map_err(std::io::Error::other)?;
+    line.push('\n');
     if let Some(path) = std::env::var_os("CORDIAL_TRACE_FILE") {
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        writeln!(file, "{line}")?;
-        file.flush()
+        write_file_record(Path::new(&path), &line)
     } else {
         let mut stderr = std::io::stderr().lock();
-        writeln!(stderr, "[TRACE] {line}")?;
+        write!(stderr, "[TRACE] {line}")?;
         stderr.flush()
     }
 }

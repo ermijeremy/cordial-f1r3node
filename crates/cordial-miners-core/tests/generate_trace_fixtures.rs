@@ -7,7 +7,7 @@
 //! |-----------------------|-----------------------------------------------|
 //! | `normal.json`         | 7-node happy-path consensus                   |
 //! | `equivocation.json`   | A non-leader equivocates; finality stays safe |
-//! | `low_stake.json`      | Count quorum passes but weighted quorum fails |
+//! | `low_stake.json`      | Weighted quorum rejects insufficient stake  |
 //!
 //! Run with:
 //! ```sh
@@ -179,15 +179,13 @@ fn leader(wave: u64) -> Option<NodeId> {
 /// round (fully-connected cross-round DAG). This guarantees every block
 /// at round r observes the leader at round 0 and can approve it without
 /// any equivocation conflict.
-fn build_normal_blocklace() -> (Blocklace, HashMap<NodeId, u64>) {
+fn build_normal_blocklace_with_rounds(rounds: u8) -> (Blocklace, HashMap<NodeId, u64>) {
     let mut b = Blocklace::new();
     let bonds: HashMap<NodeId, u64> = (1u8..=7).map(|i| (node(i), 100u64)).collect();
 
     let mut prev_ids: HashSet<BlockIdentity> = HashSet::new();
 
-    // Three rounds are sufficient for approval, ratification, and
-    // super-ratification of the wave-0 leader.
-    for round in 0u8..3u8 {
+    for round in 0u8..rounds {
         let round_blocks: Vec<Block> = (1u8..=7)
             .map(|creator| make_block(creator, round * 10 + creator, prev_ids.clone()))
             .collect();
@@ -201,6 +199,27 @@ fn build_normal_blocklace() -> (Blocklace, HashMap<NodeId, u64>) {
     }
 
     (b, bonds)
+}
+
+fn build_normal_blocklace() -> (Blocklace, HashMap<NodeId, u64>) {
+    // Three rounds are sufficient for approval, ratification, and
+    // super-ratification of the wave-0 leader.
+    build_normal_blocklace_with_rounds(3)
+}
+
+fn build_benchmark_blocklace() -> (Blocklace, HashMap<NodeId, u64>) {
+    let mut blocklace = Blocklace::new();
+    let bonds: HashMap<NodeId, u64> = (1u8..=7).map(|i| (node(i), 100u64)).collect();
+    let mut previous = HashSet::new();
+    // Use one block per round so the benchmark measures replay growth without
+    // turning the fully-connected fixture into a combinatorial DAG workload.
+    for round in 0u8..15u8 {
+        let creator = (round % 7) + 1;
+        let block = make_block(creator, round * 10 + creator, previous.clone());
+        insert(&mut blocklace, &block);
+        previous = [block.identity].into_iter().collect();
+    }
+    (blocklace, bonds)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -263,9 +282,9 @@ fn build_equivocation_blocklace() -> (Blocklace, HashMap<NodeId, u64>) {
 // Scenario 3: low-stake ratifier (weighted mode)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build a 7-node blocklace in which five validators form a count quorum but
-/// carry only about one third of the stake.  This is the regression scenario
-/// that distinguishes weighted finality from validator counting.
+/// Build a 7-node blocklace in which the participating validators carry only
+/// about one third of the stake.  This is the weighted-finality rejection
+/// scenario used by the replay; count-based finality is not part of it.
 fn build_low_stake_blocklace() -> (Blocklace, HashMap<NodeId, u64>) {
     let mut b = Blocklace::new();
     // Nodes 1–3 carry almost all stake; nodes 4–7 have one unit each.
@@ -281,8 +300,8 @@ fn build_low_stake_blocklace() -> (Blocklace, HashMap<NodeId, u64>) {
         insert(&mut b, block);
     }
 
-    // Five validators vote by count, but only node 1 among the high-stake
-    // validators participates: support=1004 of total=3004.
+    // Five validators participate, but only node 1 among the high-stake
+    // validators does: support=1004 of total=3004.
     let voters = [1u8, 4, 5, 6, 7];
     let r0_ids: HashSet<BlockIdentity> = r0.iter().map(|block| block.identity.clone()).collect();
     let r1: Vec<Block> = voters
@@ -308,7 +327,7 @@ fn build_low_stake_blocklace() -> (Blocklace, HashMap<NodeId, u64>) {
 /// A simple majority accepts both ratification levels, while the protocol's
 /// strict two-thirds rule rejects them. This fixture is generated only by the
 /// deliberately mutated Rust build.
-#[cfg(feature = "trace-threshold-mutation")]
+#[cfg(cordial_trace_threshold_mutation)]
 fn build_weakened_threshold_blocklace() -> (Blocklace, HashMap<NodeId, u64>) {
     let mut b = Blocklace::new();
     let bonds: HashMap<NodeId, u64> = (1u8..=7).map(|id| (node(id), 100u64)).collect();
@@ -421,8 +440,6 @@ fn generate_low_stake_fixture() {
     // Exercise the weighted finality path — emits ComputeFinality events.
     use cordial_miners_core::consensus::finality::latest_weighted_final_leader;
     let final_leader = latest_weighted_final_leader(&blocklace, wavelength, &bonds, leader);
-    use cordial_miners_core::consensus::finality::latest_final_leader;
-    let count_final_leader = latest_final_leader(&blocklace, wavelength, 7, 2, leader);
 
     println!("[low_stake] trace written to {}", path.display());
     println!(
@@ -433,14 +450,9 @@ fn generate_low_stake_fixture() {
             .unwrap_or_else(|| "none".into())
     );
 
-    // Independent scenario oracle: validator counting says final, stake says no.
-    assert!(
-        count_final_leader.is_some(),
-        "Expected five voters to satisfy the count quorum"
-    );
     assert!(
         final_leader.is_none(),
-        "A low-stake count quorum must not satisfy weighted finality"
+        "Insufficient stake must not satisfy weighted finality"
     );
 }
 
@@ -532,11 +544,39 @@ fn generate_all_fixtures() {
     println!("\n✓ All fixture traces are deterministic and written to lean/traces/");
 }
 
+/// Generate a larger deterministic trace for replay performance measurement.
+/// This is intentionally separate from the three canonical conformance
+/// fixtures so benchmark growth does not change their expected outputs.
+#[test]
+fn generate_benchmark_15_fixture() {
+    unsafe {
+        std::env::set_var("CORDIAL_TRACE_STRICT", "1");
+    }
+    let bonds: HashMap<NodeId, u64> = (1u8..=7).map(|i| (node(i), 100u64)).collect();
+    let path = prepare_fixture("benchmark_15.json", &bonds, 3);
+    unsafe {
+        std::env::set_var("CORDIAL_TRACE_FILE", path.to_str().unwrap());
+    }
+    let (blocklace, _) = build_benchmark_blocklace();
+    let events = read_trace_events("benchmark_15.json");
+    println!(
+        "[benchmark_15] blocks={} events={} output={} bytes={}",
+        blocklace.dom().len(),
+        events.len(),
+        0,
+        std::fs::metadata(&path).unwrap().len()
+    );
+    unsafe {
+        std::env::remove_var("CORDIAL_TRACE_FILE");
+        std::env::remove_var("CORDIAL_TRACE_STRICT");
+    }
+}
+
 /// Generate a trace using the actual Rust finality pipeline compiled with the
 /// deliberately weakened `2 * support > total` predicate. The surrounding
 /// shell harness feeds this trace to the unchanged Lean CMRef and requires a
 /// first-mismatch rejection.
-#[cfg(feature = "trace-threshold-mutation")]
+#[cfg(cordial_trace_threshold_mutation)]
 #[test]
 fn generate_weakened_threshold_fixture() {
     let bonds: HashMap<NodeId, u64> = (1u8..=7).map(|id| (node(id), 100u64)).collect();

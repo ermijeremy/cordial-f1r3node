@@ -7,8 +7,9 @@ trap 'rm -rf -- "$mutation_dir"' EXIT
 
 cd "$repo_root"
 CORDIAL_TRACE_DIR="$mutation_dir" \
+RUSTFLAGS="${RUSTFLAGS:-} --cfg cordial_trace_threshold_mutation" \
   cargo test -j 2 -p cordial-miners-core \
-    --features trace-threshold-mutation \
+    --features trace \
     --test generate_trace_fixtures generate_weakened_threshold_fixture -- \
     --exact --nocapture --test-threads=1
 
