@@ -489,7 +489,10 @@ private def checkEvent (state : ReplayState) (event : TraceEvent) : Except Strin
       checkCertificateEvent state event
       pure { state with certificates := state.certificates ++ [event] }
   | .computeFinality event =>
-      checkOptionalWeightHash state event.weightTableHash
+      let weightHash ← match event.weightTableHash with
+        | some hash => pure hash
+        | none => throw "unweighted finality is outside the weighted replay boundary"
+      checkWeightHash state weightHash
       if event.wavelength != state.config.wavelength then
         throw s!"wavelength mismatch: Rust={event.wavelength}, config={state.config.wavelength}"
       let candidate ← requireKnownBlock state event.blockHash
@@ -528,6 +531,11 @@ private def checkEvent (state : ReplayState) (event : TraceEvent) : Except Strin
         finalityDecisions := state.finalityDecisions ++ [rustFinal] }
   | .runTauOrder event =>
       if event.wavelength != state.config.wavelength then throw "tau wavelength mismatch"
+      match state.lastTau with
+      | some (_, previousOrder) =>
+          if state.emitted != previousOrder then
+            throw s!"new tau run started before previous output was complete: emitted {state.emitted.length}/{previousOrder.length}"
+      | none => pure ()
       let (latest, leanOrder) ← computeTau state event.wave
       if latest.rustHash != event.latestLeaderHash then
         throw s!"tau leader mismatch: Rust={event.latestLeaderHash}, Lean={latest.rustHash}"

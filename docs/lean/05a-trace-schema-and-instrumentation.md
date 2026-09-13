@@ -61,8 +61,8 @@ in isolated subprocesses. Strict mode does not claim crash-durable storage.
 | `detect_equivocation` | `node_id` (observer), `equivocator`, `round`, `conflicting_block_hashes` | `consensus::cordiality::all_equivocations_for_observer` |
 | `accept_approval` | `node_id`, `wave?`, `round`, `approver`, `approver_hash`, `target_hash` | memoized approval evaluation |
 | `build_threshold_certificate` | `node_id`, `wave?`, `kind`, `leader_hash`, `ratifier_hash?`, `certificate_id`, `approver_hashes`, `approvers`, `approver_count`, `approver_weight`, `total_weight`, `weight_table_hash` | weighted ratification and super-ratification |
-| `compute_finality` | `node_id`, `wave`, `wavelength`, `block_hash`, `decision`, `certificate_id?`, `output_prefix_hash?`, `weight_table_hash?` | weighted and unweighted final-leader evaluation |
-| `run_tau_order` | `node_id`, `wave`, `wavelength`, `latest_leader_hash`, `ordered_block_hashes`, `output_len` | weighted and unweighted `tau` |
+| `compute_finality` | `node_id`, `wave`, `wavelength`, `block_hash`, `decision`, `certificate_id?`, `output_prefix_hash?`, `weight_table_hash?` | weighted final-leader evaluation (unweighted records remain schema-compatible but are outside replay) |
+| `run_tau_order` | `node_id`, `wave`, `wavelength`, `latest_leader_hash`, `ordered_block_hashes`, `output_len` | weighted `tau` used by Issue #188 replay |
 | `emit_output` | `node_id`, `wave`, `block_hash`, `output_index`, `output_prefix_hash` | each `tau` output item |
 | `send_package` | `node_id`, `peer_id`, `block_hashes` | network node and adversarial simulator send paths |
 | `deliver_package` | `node_id`, `peer_id`, `block_hashes` | network node and adversarial simulator delivery paths |
@@ -165,28 +165,50 @@ handwritten protocol transcripts.
 - Blocks: all seven validators create round-0 blocks. Only nodes
   `01,04,05,06,07` participate in rounds 1 and 2, for 17 blocks total.
 - Wave/leader: wavelength 3, wave 0 leader is node `01`.
-- Evidence: five validators form a count quorum, but their distinct stake is
-  only 1004/3004. Rust's count-based control assertion finalizes; the weighted
-  implementation does not build a certificate and returns no final leader.
+- Evidence: five validators participate, but their distinct stake is only
+  1004/3004. The weighted implementation does not build a certificate and
+  returns no final leader; count-based finality is deliberately not used by
+  Issue #188 replay.
 - Expected result: `not_finalized`. Lean independently obtains the same answer
   from the sidecar weights and strict `3 * support > 2 * total` arithmetic.
   This direct-finality scenario intentionally has no tau/output event.
-- Principal trace events: 17 `insert_block`, 57 actual approval evaluations,
-  no certificate, and one `compute_finality` (75 total).
+- Principal trace events: 17 `insert_block`, 11 actual approval evaluations,
+  no certificate, and one `compute_finality` (29 total).
 
 The generator executes every scenario twice and compares all six trace/config
 files byte-for-byte. This catches randomized set traversal and unstable ids.
 
 ## Genuine threshold mutation
 
-Cargo feature `trace-threshold-mutation` is a deliberately broken, test-only
-feature that replaces the production predicate with `2 * support > total`.
-It implies `trace` and is never used by normal builds. The mutation generator
+The mutation harness uses the private rustc configuration
+`cordial_trace_threshold_mutation`; it is not a Cargo feature and therefore
+cannot be enabled accidentally by `--all-features`. It deliberately replaces
+the production predicate with `2 * support > total`. The mutation generator
 runs the real approval → certificate → finality call path with four equally
 weighted participants out of seven and writes only to a temporary directory.
 `scripts/issue188_mutation_test.sh` feeds that trace to unchanged Lean code and
 requires rejection. The script does not edit a recorded decision and does not
 write the mutated trace into `lean/traces/`.
+
+## Weighted replay boundary and benchmark
+
+Issue #188 replay accepts only stake-weighted finality events. A
+`compute_finality` record must carry the configured `weight_table_hash`; an
+unweighted record is rejected as outside the CMRef conformance boundary. The
+earlier count-based Rust/formal APIs remain available for their existing tests,
+but are not used as an alternative replay oracle.
+
+`scripts/issue188_benchmark.sh` runs the same Rust consensus path for a
+deterministic 15-round, seven-validator history and replays the resulting trace
+through Lean. It reports block count, event count, trace bytes, replay elapsed
+time, and maximum resident memory. It has a 30-second safety timeout by default
+(`ISSUE188_BENCHMARK_TIMEOUT` can override it) so a large formal replay cannot
+exhaust a developer workstation. In the current implementation the Rust run
+produces 15 blocks, 15 events, and 4,349 bytes; Lean replay did not complete
+within the 30-second limit. For comparison, the 48-event normal fixture replay
+completed in 12.56 seconds and used approximately 1.1 GiB RSS on the same
+machine. The benchmark is separate from the three small canonical fixtures and
+is not used to define their expected results.
 
 ## Adapter and formal trust boundaries
 

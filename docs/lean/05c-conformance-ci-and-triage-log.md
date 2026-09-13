@@ -106,11 +106,13 @@ was finalized.
 - an incorrect output-prefix hash; and
 - a wrong weight-table hash.
 
-The true mutation gate is separate. Cargo feature
-`trace-threshold-mutation` compiles the Rust quorum predicate as
+The true mutation gate is separate. The private rustc configuration
+`cordial_trace_threshold_mutation` compiles the Rust quorum predicate as
 `2 * support > total`, executes the real approval/certificate/finality path
 with four of seven equally weighted validators, and writes the trace to an
-ephemeral directory. Unmodified Lean must reject it. A successful mutation
+ephemeral directory. It is supplied only by the mutation script, not exposed
+as a Cargo feature, so `--all-features` cannot enable it. Unmodified Lean must
+reject it. A successful mutation
 gate looks like:
 
 ```text
