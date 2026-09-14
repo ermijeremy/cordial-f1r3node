@@ -2,9 +2,11 @@
 
 ## Reproducible pipeline
 
-Status: the executable replay gate exists; full Issue #188 acceptance remains
-blocked on the KR4 ordering refinement proof. A green run checks independent
-ordering comparison, not a theorem that `computeTau` implements opaque `tau`.
+Status: the executable replay gate exists. The existing KR4 ordering
+definition is opaque, so a proved refinement theorem connecting `computeTau`
+to formal `tau` is documented as a follow-up formalization task. A green run
+checks independent executable ordering comparison; it does not claim that
+`computeTau` implements opaque `tau` by a proved refinement theorem.
 
 Run the complete local gate from the repository root:
 
@@ -183,7 +185,7 @@ or deriving the expected answer from the trace's result field.
 
 | Date | Observation | Classification | Resolution |
 |---|---|---|---|
-| 2026-09-07 | `computeTau` was called a refinement despite no theorem relating it to opaque `tau`; the formal signature omits canonical tie-break keys and the replay horizon. | Lean-spec problem | **OPEN / PR blocker.** Removed unsupported refinement/proof-sketch claims. Complete the KR4 ordering specification and prove executable correspondence; no replacement axiom added. |
+| 2026-09-07 | `computeTau` was called a refinement despite no theorem relating it to opaque `tau`; the formal signature omits canonical tie-break keys and the replay horizon. | Lean-spec follow-up | Removed unsupported refinement/proof-sketch claims. The replay compares executable ordering with Rust for this PR; completing the KR4 ordering specification and proving executable correspondence is a documented post-PR task. No replacement axiom was added. |
 | 2026-09-07 | Conformance CI checked out only this repository although Cargo resolves sibling `f1r3node` workspace path dependencies. | CI setup bug | Added a pinned sibling checkout and corrected all Lean/cache/working-directory paths. Hosted execution still requires a real CI run. |
 | 2026-09-07 | Runtime trace emission silently discarded file-open/write errors. | trace instrumentation bug | Added fallible `try_emit`, opt-in strict emission, mandatory strict fixture capture, and subprocess tests for open and write failures. |
 | 2026-09-07 | Mapping grouped declarations, referenced wildcard tests and nonexistent negative labels, and misidentified an output emission boundary. | documentation/test coverage bug | Added one row per named KR theorem/lemma, exact checked links, explicit proof-only coverage, correct negative labels, and actual duplicate-member/evidence negative tests. |
