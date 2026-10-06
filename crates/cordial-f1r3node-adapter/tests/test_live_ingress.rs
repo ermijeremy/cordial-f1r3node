@@ -152,7 +152,7 @@ fn live_ingress_buffers_out_of_order_blocks_until_predecessors_arrive() {
 
     let mut ingress = LiveIngress::new(RecordingAdapter::default());
 
-    ingress
+    let translated_child = ingress
         .ingest_block_message(&child)
         .expect("child block should be accepted into pending state");
     assert_eq!(ingress.blocklace().dom().len(), 0);
@@ -163,6 +163,15 @@ fn live_ingress_buffers_out_of_order_blocks_until_predecessors_arrive() {
         .expect("parent block should release buffered child");
     assert_eq!(ingress.blocklace().dom().len(), 2);
     assert!(ingress.pending_blocks().is_empty());
+    let mirrored_child = ingress
+        .blocklace()
+        .content(&translated_child.identity)
+        .expect("released child should be stored");
+    assert_eq!(
+        bincode::serialize(mirrored_child).unwrap(),
+        bincode::serialize(&translated_child.content).unwrap(),
+        "pending release must not rewrite serialized block content"
+    );
 }
 
 #[test]
@@ -249,6 +258,45 @@ fn live_ingress_does_not_substitute_same_hash_predecessor_identity() {
     assert_eq!(pending.payload, child.content.payload);
     assert_eq!(pending.predecessors, child.content.predecessors);
     assert!(child.content.predecessors.contains(&alternate_parent));
+}
+
+#[test]
+fn trusted_boundary_records_only_missing_predecessors_without_rewriting_content() {
+    let parent_key = test_signing_key(17);
+    let parent = build_test_block_with_predecessors(
+        NodeId(test_public_key(&parent_key)),
+        HashSet::new(),
+        &parent_key,
+        1,
+        1,
+    );
+    let missing = BlockIdentity {
+        content_hash: [0x44; 32],
+        creator: NodeId(vec![0x55]),
+        signature: vec![0x66; 64],
+    };
+    let child_key = test_signing_key(18);
+    let child = build_test_block_with_predecessors(
+        NodeId(test_public_key(&child_key)),
+        HashSet::from([parent.identity.clone(), missing.clone()]),
+        &child_key,
+        2,
+        2,
+    );
+    let original_content = bincode::serialize(&child.content).unwrap();
+
+    let mut ingress = LiveIngress::new(RecordingAdapter::default());
+    ingress.ingest_trusted_block(parent).unwrap();
+    ingress.ingest_trusted_window_block(child.clone()).unwrap();
+
+    let mirrored = ingress.blocklace().content(&child.identity).unwrap();
+    assert_eq!(bincode::serialize(mirrored).unwrap(), original_content);
+    assert_eq!(
+        ingress
+            .blocklace()
+            .trusted_boundary_predecessors(&child.identity),
+        Some(&HashSet::from([missing]))
+    );
 }
 
 #[test]
