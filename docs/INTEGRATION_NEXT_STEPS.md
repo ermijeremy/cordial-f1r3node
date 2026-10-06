@@ -71,21 +71,13 @@ The split exists so consumers who only want consensus pay nothing for f1r3node i
 
 ## Task 2 — Wire up `compute_bonds` so `new_bonds` reflects post-state
 
-**Status:** Documented as a follow-up; placeholder in code.
+**Status:** ✅ **COMPLETED** — execution now uses `compute_state_with_bonds` and translates the post-state bond set with checked stakes and deterministic ordering.
 
-**Why it matters.** `F1r3RspaceRuntime::execute_block` currently returns the caller's input bonds verbatim in `ExecutionResult.new_bonds`. That's wrong: bonds in f1r3node are *state-hash-addressable*, meaning they live inside the tuplespace and change when system deploys (slash, register validator) execute. After running deploys, the *correct* bonds may differ from the pre-deploy bonds.
+**Why it matters.** Bonds in f1r3node are *state-hash-addressable*: system deploys can change them during execution, so the input bond set is not a valid result for the new state.
 
-**What to build.** In `crates/blocklace-f1r3rspace/src/lib.rs`, after the `compute_state` call returns the post-state hash, call `self.f1r3_rt.compute_bonds(&post_hash).await?` and translate the resulting `Vec<f1r3node::Bond>` into our `Vec<blocklace::execution::Bond>`. Replace the current line:
+**Implementation.** `F1r3RspaceRuntime::execute_block` calls `compute_state_with_bonds`, translates the returned host bonds with checked `i64` to `u64` conversion, and sorts them by validator identity before assigning `ExecutionResult.new_bonds`. Runtime and bond-query failures are propagated.
 
-```rust
-new_bonds: request.bonds.clone(), // unchanged; see module docs
-```
-
-with the translated result.
-
-**Difficulty:** Small. The method exists on `RuntimeManager` (line 729 in `runtime_manager.rs`); only translation glue is needed. There's a `bond_to_blocklace` helper to write — straightforward `validator: NodeId(b.validator.to_vec()), stake: b.stake as u64`.
-
-**Test it.** Once Task 1 lands, extend it: insert a `SystemDeployRequest::Slash` for a known validator and assert that validator no longer appears in `result.new_bonds`.
+**Remaining integration coverage.** Extend the real RSpace harness with a successful slash and assert that the validator no longer appears in `result.new_bonds`.
 
 ---
 

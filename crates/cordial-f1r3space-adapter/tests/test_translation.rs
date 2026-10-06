@@ -15,14 +15,14 @@ use cordial_miners_core::execution::{
 use cordial_miners_core::types::NodeId;
 
 use cordial_f1r3space_adapter::{
-    build_block_data, processed_deploy_from_f1r3node, signed_deploy_to_f1r3node,
-    system_deploy_from_f1r3node, system_deploy_to_f1r3node,
+    bonds_from_f1r3node, build_block_data, processed_deploy_from_f1r3node,
+    signed_deploy_to_f1r3node, system_deploy_from_f1r3node, system_deploy_to_f1r3node,
 };
 
 use casper::rust::util::rholang::system_deploy_enum::SystemDeployEnum;
 use models::rust::casper::protocol::casper_message::{
-    ProcessedDeploy as F1r3ProcessedDeploy, ProcessedSystemDeploy as F1r3ProcessedSystemDeploy,
-    SystemDeployData,
+    Bond as F1r3Bond, ProcessedDeploy as F1r3ProcessedDeploy,
+    ProcessedSystemDeploy as F1r3ProcessedSystemDeploy, SystemDeployData,
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -44,6 +44,47 @@ fn sample_signed_deploy(sig_byte: u8) -> SignedDeploy {
 
 fn node(b: u8) -> NodeId {
     NodeId(vec![b])
+}
+
+// ── bonds_from_f1r3node ─────────────────────────────────────────────────
+
+#[test]
+fn post_state_bonds_are_checked_and_sorted_deterministically() {
+    let bonds = vec![
+        F1r3Bond {
+            validator: vec![2].into(),
+            stake: 200,
+        },
+        F1r3Bond {
+            validator: vec![1].into(),
+            stake: 100,
+        },
+    ];
+
+    assert_eq!(
+        bonds_from_f1r3node(&bonds).unwrap(),
+        vec![
+            Bond {
+                validator: node(1),
+                stake: 100,
+            },
+            Bond {
+                validator: node(2),
+                stake: 200,
+            },
+        ]
+    );
+}
+
+#[test]
+fn negative_post_state_bond_is_rejected() {
+    let bonds = vec![F1r3Bond {
+        validator: vec![1].into(),
+        stake: -1,
+    }];
+
+    let error = bonds_from_f1r3node(&bonds).unwrap_err();
+    assert!(format!("{error:?}").contains("negative stake"));
 }
 
 // ── signed_deploy_to_f1r3node ────────────────────────────────────────────

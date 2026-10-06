@@ -46,11 +46,9 @@
 //! - **Block data** (sender, seq_num, block_number): populated from
 //!   `ExecutionRequest.block_number` plus a default sender derived from the
 //!   bonds list. Timestamp is 0.
-//! - **Bonds**: `execute_block` does not update bonds directly; bonds are
-//!   state-hash-addressable in f1r3node and get computed separately via
-//!   `RuntimeManager::compute_bonds`. The adapter returns the caller's
-//!   input bonds unchanged in `new_bonds` for now (future work: call
-//!   `compute_bonds` on the post-state hash).
+//! - **Bonds**: f1r3node derives bonds from the post-state produced by the
+//!   same execution. The adapter translates that result into a deterministic
+//!   validator order and rejects negative host stake values.
 
 pub mod error;
 pub mod lmdb_store;
@@ -80,7 +78,7 @@ use crypto::rust::public_key::PublicKey;
 use crypto::rust::signatures::secp256k1::Secp256k1;
 use crypto::rust::signatures::signed::Signed;
 use models::rust::casper::protocol::casper_message::{
-    DeployData, ProcessedDeploy, ProcessedSystemDeploy, SystemDeployData,
+    Bond as F1r3Bond, DeployData, ProcessedDeploy, ProcessedSystemDeploy, SystemDeployData,
 };
 use rholang::rust::interpreter::system_processes::BlockData;
 
@@ -133,16 +131,20 @@ impl<'a> CoreRuntimeManager for F1r3RspaceRuntime<'a> {
             HashMap<models::rust::block_hash::BlockHash, models::rust::validator::Validator>,
         > = Some(HashMap::new()); // we don't track invalid blocks at this layer
 
-        // Call f1r3node. compute_state is async → block_on a Tokio handle.
-        let (post_hash, f1r3_processed, f1r3_system) = tokio::runtime::Handle::current()
-            .block_on(self.f1r3_rt.compute_state(
-                &start_hash,
-                terms,
-                system_deploys,
-                block_data,
-                invalid_blocks,
-            ))
-            .map_err(|e| RuntimeError::InternalError(format!("compute_state: {e:?}")))?;
+        // Execute and query bonds from the resulting post-state with the same
+        // spawned runtime. This avoids returning the request's stale bond set.
+        let (post_hash, f1r3_processed, f1r3_system, f1r3_bonds) =
+            tokio::runtime::Handle::current()
+                .block_on(self.f1r3_rt.compute_state_with_bonds(
+                    &start_hash,
+                    terms,
+                    system_deploys,
+                    block_data,
+                    invalid_blocks,
+                ))
+                .map_err(|e| {
+                    RuntimeError::InternalError(format!("compute_state_with_bonds: {e:?}"))
+                })?;
 
         // Translate back into ExecutionResult
         let processed_deploys: Vec<CmProcessedDeploy> = f1r3_processed
@@ -154,15 +156,42 @@ impl<'a> CoreRuntimeManager for F1r3RspaceRuntime<'a> {
             .iter()
             .map(system_deploy_from_f1r3node)
             .collect();
+        let new_bonds = bonds_from_f1r3node(&f1r3_bonds)?;
 
         Ok(ExecutionResult {
             post_state_hash: post_hash.to_vec(),
             processed_deploys,
             rejected_deploys: Vec::new(), // f1r3node doesn't return rejected here
             system_deploys: system_deploys_out,
-            new_bonds: request.bonds.clone(), // unchanged; see module docs
+            new_bonds,
         })
     }
+}
+
+/// Translate post-state bonds into the core representation.
+///
+/// The host uses signed stakes, while consensus weights are unsigned. A
+/// negative host stake is invalid state and must not wrap into a large weight.
+/// Results are sorted by validator bytes so block payloads are deterministic
+/// even if the host returns bonds in a different iteration order.
+pub fn bonds_from_f1r3node(bonds: &[F1r3Bond]) -> Result<Vec<Bond>, RuntimeError> {
+    let mut translated = bonds
+        .iter()
+        .map(|bond| {
+            let stake = u64::try_from(bond.stake).map_err(|_| {
+                RuntimeError::InternalError(format!(
+                    "post-state bond for validator {:?} has negative stake {}",
+                    bond.validator, bond.stake
+                ))
+            })?;
+            Ok(Bond {
+                validator: NodeId(bond.validator.to_vec()),
+                stake,
+            })
+        })
+        .collect::<Result<Vec<_>, RuntimeError>>()?;
+    translated.sort_by(|left, right| left.validator.0.cmp(&right.validator.0));
+    Ok(translated)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -329,8 +358,3 @@ fn rejected_deploy_placeholder(sig: Vec<u8>) -> RejectedDeploy {
         reason: RejectReason::InvalidSignature,
     }
 }
-
-// Keep the Bond import referenced so rustc doesn't warn about unused
-// imports when adapter bodies evolve.
-#[allow(dead_code)]
-const _BOND_MARKER: std::marker::PhantomData<Bond> = std::marker::PhantomData;
