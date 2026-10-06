@@ -35,10 +35,10 @@
 //! - **pre/post state hashes** are `Vec<u8>` on our side, `prost::bytes::Bytes`
 //!   on f1r3node's side. Both are just byte sequences; conversion is free.
 //! - **Deploys**: our `SignedDeploy` carries a `Vec<u8>` term; f1r3node's
-//!   `DeployData` wants a `String`. We UTF-8-decode lossily with `from_utf8_lossy`.
-//! - **Signatures**: f1r3node's `Signed<DeployData>` is constructed via
-//!   `Signed::from_existing_signature` rather than re-signing, so our
-//!   deploy's existing signature is preserved verbatim.
+//!   `DeployData` wants a `String`. Non-UTF-8 terms are rejected rather than
+//!   rewritten before signature verification.
+//! - **Signatures**: supported algorithms are translated explicitly and the
+//!   signature is verified with `Signed::from_signed_data` before execution.
 //! - **System deploys**: `Slash` requires a `PublicKey` and a block hash
 //!   (what's being slashed). Our `SystemDeployRequest::Slash` now carries
 //!   both the validator NodeId and the `invalid_block_hash`, so we pass
@@ -62,9 +62,10 @@ pub use repository::BlocklaceRepository;
 use std::collections::HashMap;
 
 use cordial_miners_core::execution::{
-    Bond, ExecutionRequest, ExecutionResult, ProcessedDeploy as CmProcessedDeploy,
-    ProcessedSystemDeploy as CmProcessedSystemDeploy, RejectReason, RejectedDeploy, RuntimeError,
-    RuntimeManager as CoreRuntimeManager, SignedDeploy as CmSignedDeploy, SystemDeployRequest,
+    Bond, DeploySignatureAlgorithm, ExecutionRequest, ExecutionResult,
+    ProcessedDeploy as CmProcessedDeploy, ProcessedSystemDeploy as CmProcessedSystemDeploy,
+    RejectReason, RejectedDeploy, RuntimeError, RuntimeManager as CoreRuntimeManager,
+    SignedDeploy as CmSignedDeploy, SystemDeployRequest,
 };
 use cordial_miners_core::types::NodeId;
 
@@ -76,6 +77,8 @@ use casper::rust::util::rholang::system_deploy_enum::SystemDeployEnum;
 use crypto::rust::hash::blake2b512_random::Blake2b512Random;
 use crypto::rust::public_key::PublicKey;
 use crypto::rust::signatures::secp256k1::Secp256k1;
+use crypto::rust::signatures::secp256k1_eth::Secp256k1Eth;
+use crypto::rust::signatures::signatures_alg::SignaturesAlg;
 use crypto::rust::signatures::signed::Signed;
 use models::rust::casper::protocol::casper_message::{
     Bond as F1r3Bond, DeployData, ProcessedDeploy, ProcessedSystemDeploy, SystemDeployData,
@@ -129,7 +132,22 @@ impl<'a> CoreRuntimeManager for F1r3RspaceRuntime<'a> {
 
         let invalid_blocks: Option<
             HashMap<models::rust::block_hash::BlockHash, models::rust::validator::Validator>,
-        > = Some(HashMap::new()); // we don't track invalid blocks at this layer
+        > = Some(
+            request
+                .system_deploys
+                .iter()
+                .filter_map(|deploy| match deploy {
+                    SystemDeployRequest::Slash {
+                        validator,
+                        invalid_block_hash,
+                    } => Some((
+                        prost::bytes::Bytes::copy_from_slice(invalid_block_hash),
+                        prost::bytes::Bytes::copy_from_slice(&validator.0),
+                    )),
+                    SystemDeployRequest::CloseBlock => None,
+                })
+                .collect(),
+        );
 
         // Execute and query bonds from the resulting post-state with the same
         // spawned runtime. This avoids returning the request's stale bond set.
@@ -200,13 +218,13 @@ pub fn bonds_from_f1r3node(bonds: &[F1r3Bond]) -> Result<Vec<Bond>, RuntimeError
 
 /// Convert our `SignedDeploy` to f1r3node's `Signed<DeployData>`.
 ///
-/// Constructs `Signed<_>` directly via public fields so the signature the
-/// caller supplied is preserved verbatim (no re-verification). See the
-/// note inside the function body for why we bypass
-/// `Signed::from_signed_data`.
+/// The algorithm is selected from the deploy metadata and the signature is
+/// verified before any call into the execution engine.
 pub fn signed_deploy_to_f1r3node(sd: &CmSignedDeploy) -> Result<Signed<DeployData>, RuntimeError> {
     let data = DeployData {
-        term: String::from_utf8_lossy(&sd.deploy.term).into_owned(),
+        term: String::from_utf8(sd.deploy.term.clone()).map_err(|error| {
+            RuntimeError::InvalidDeploy(format!("deploy term is not valid UTF-8: {error}"))
+        })?,
         time_stamp: i64::try_from(sd.deploy.timestamp)
             .map_err(|_| RuntimeError::InternalError("timestamp overflow".into()))?,
         phlo_price: i64::try_from(sd.deploy.phlo_price)
@@ -219,23 +237,24 @@ pub fn signed_deploy_to_f1r3node(sd: &CmSignedDeploy) -> Result<Signed<DeployDat
         expiration_timestamp: None,
     };
 
-    // f1r3node's SignaturesAlgFactory explicitly disables ed25519, registering
-    // only secp256k1 and secp256k1-eth for deploys. Since Signed's fields are
-    // all `pub`, we construct directly rather than going through
-    // Signed::from_signed_data (which would re-verify the sig). The deploy
-    // pool already verified at admission time; another round-trip would
-    // both duplicate work and fail for our ed25519 defaults.
-    //
-    // Adapter callers bringing secp256k1-signed deploys will hash/verify
-    // correctly downstream; ed25519-signed deploys won't be recognized by
-    // f1r3node's verification paths, so mixing algorithms across the boundary
-    // is a caller problem (document in module header if needed).
-    Ok(Signed {
+    let sig_algorithm: Box<dyn SignaturesAlg> = match &sd.signature_algorithm {
+        DeploySignatureAlgorithm::Secp256k1 => Box::new(Secp256k1),
+        DeploySignatureAlgorithm::Secp256k1Eth => Box::new(Secp256k1Eth),
+        unsupported => {
+            return Err(RuntimeError::UnsupportedDeploySignatureAlgorithm(
+                unsupported.as_name().to_owned(),
+            ));
+        }
+    };
+
+    Signed::from_signed_data(
         data,
-        pk: PublicKey::from_bytes(&sd.deployer),
-        sig: prost::bytes::Bytes::copy_from_slice(&sd.signature),
-        sig_algorithm: Box::new(Secp256k1),
-    })
+        PublicKey::from_bytes(&sd.deployer),
+        prost::bytes::Bytes::copy_from_slice(&sd.signature),
+        sig_algorithm,
+    )
+    .map_err(|error| RuntimeError::InvalidDeploy(format!("signature verification: {error}")))?
+    .ok_or(RuntimeError::InvalidDeploySignature)
 }
 
 /// Convert our `SystemDeployRequest` to f1r3node's `SystemDeployEnum`.
@@ -299,6 +318,7 @@ pub fn processed_deploy_from_f1r3node(
         },
         deployer: pd.deploy.pk.bytes.to_vec(),
         signature: pd.deploy.sig.to_vec(),
+        signature_algorithm: DeploySignatureAlgorithm::from_name(&pd.deploy.sig_algorithm.name()),
     };
     Ok(CmProcessedDeploy {
         deploy: signed,
@@ -354,6 +374,7 @@ fn rejected_deploy_placeholder(sig: Vec<u8>) -> RejectedDeploy {
             },
             deployer: vec![],
             signature: sig,
+            signature_algorithm: DeploySignatureAlgorithm::Unspecified,
         },
         reason: RejectReason::InvalidSignature,
     }

@@ -37,7 +37,8 @@ use serde::{Deserialize, Serialize};
 use cordial_miners_core::block::Block;
 use cordial_miners_core::crypto::hash_content;
 use cordial_miners_core::execution::{
-    Bond as CmBond, CordialBlockPayload, Deploy as CmDeploy, ProcessedDeploy as CmProcessedDeploy,
+    Bond as CmBond, CordialBlockPayload, Deploy as CmDeploy,
+    DeploySignatureAlgorithm as CmDeploySignatureAlgorithm, ProcessedDeploy as CmProcessedDeploy,
     ProcessedSystemDeploy as CmSystemDeploy, RejectReason as CmRejectReason,
     RejectedDeploy as CmRejectedDeploy, SignedDeploy as CmSignedDeploy,
 };
@@ -569,7 +570,7 @@ fn signed_deploy_to_f1r3node(sd: CmSignedDeploy) -> Result<SignedDeployData, Tra
         data: deploy_to_f1r3node(sd.deploy)?,
         pk: sd.deployer,
         sig: sd.signature,
-        sig_algorithm: "ed25519".to_string(),
+        sig_algorithm: sd.signature_algorithm.as_name().to_owned(),
     })
 }
 
@@ -578,6 +579,7 @@ fn signed_deploy_from_f1r3node(sd: &SignedDeployData) -> Result<CmSignedDeploy, 
         deploy: deploy_from_f1r3node(&sd.data)?,
         deployer: sd.pk.clone(),
         signature: sd.sig.clone(),
+        signature_algorithm: CmDeploySignatureAlgorithm::from_name(&sd.sig_algorithm),
     })
 }
 
@@ -628,6 +630,7 @@ fn rejected_deploy_from_f1r3node(rd: &RejectedDeploy) -> CmRejectedDeploy {
             },
             deployer: vec![],
             signature: rd.sig.clone(),
+            signature_algorithm: CmDeploySignatureAlgorithm::Unspecified,
         },
         reason: CmRejectReason::InvalidSignature,
     }

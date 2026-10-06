@@ -71,7 +71,8 @@ use cordial_miners_core::consensus::{
     validate_block as core_validate_block,
 };
 use cordial_miners_core::execution::{
-    DeployPool, DeployPoolConfig, PoolError, SignedDeploy as CmSignedDeploy,
+    DeployPool, DeployPoolConfig, DeploySignatureAlgorithm, PoolError,
+    SignedDeploy as CmSignedDeploy,
 };
 use cordial_miners_core::types::{BlockIdentity, NodeId};
 
@@ -514,6 +515,7 @@ where
             },
             deployer: deploy.pk.clone(),
             signature: deploy.sig.clone(),
+            signature_algorithm: DeploySignatureAlgorithm::from_name(&deploy.sig_algorithm),
         };
         let sig = cm_signed.signature.clone();
 

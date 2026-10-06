@@ -2,8 +2,8 @@ use cordial_miners_core::blocklace::Blocklace;
 use cordial_miners_core::crypto::CryptoVerifier;
 use cordial_miners_core::crypto::hash_content;
 use cordial_miners_core::execution::{
-    BlockState, Bond, CordialBlockPayload, Deploy, DeployPool, DeployPoolConfig, PoolError,
-    ProcessedDeploy, SignedDeploy, compute_deploys_in_scope,
+    BlockState, Bond, CordialBlockPayload, Deploy, DeployPool, DeployPoolConfig,
+    DeploySignatureAlgorithm, PoolError, ProcessedDeploy, SignedDeploy, compute_deploys_in_scope,
 };
 use cordial_miners_core::{Block, BlockContent, BlockIdentity, NodeId};
 use std::collections::HashSet;
@@ -39,6 +39,7 @@ fn make_deploy(sig_byte: u8, valid_after: u64, timestamp: u64, phlo_price: u64) 
         },
         deployer: vec![sig_byte; 32],
         signature: vec![sig_byte; 64],
+        signature_algorithm: DeploySignatureAlgorithm::Secp256k1,
     }
 }
 

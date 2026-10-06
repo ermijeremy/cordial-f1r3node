@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use cordial_miners_core::Block;
 use cordial_miners_core::crypto::hash_content;
 use cordial_miners_core::execution::{
-    BlockState, Bond as CmBond, CordialBlockPayload, Deploy as CmDeploy,
+    BlockState, Bond as CmBond, CordialBlockPayload, Deploy as CmDeploy, DeploySignatureAlgorithm,
     ProcessedDeploy as CmProcessed, ProcessedSystemDeploy as CmSystem,
     SignedDeploy as CmSignedDeploy,
 };
@@ -71,6 +71,7 @@ fn sample_payload() -> CordialBlockPayload {
                 },
                 deployer: vec![0xaa; 32],
                 signature: vec![0xbb; 64],
+                signature_algorithm: DeploySignatureAlgorithm::Ed25519,
             },
             cost: 100,
             is_failed: false,
@@ -135,6 +136,7 @@ fn body_fields_mirror_payload() {
     assert_eq!(msg.body.deploys.len(), 1);
     assert_eq!(msg.body.deploys[0].cost, 100);
     assert!(!msg.body.deploys[0].is_failed);
+    assert_eq!(msg.body.deploys[0].deploy.sig_algorithm, "ed25519");
 
     assert_eq!(msg.body.system_deploys.len(), 1);
     assert!(matches!(
@@ -165,7 +167,7 @@ fn block_to_message_and_back_preserves_payload_and_creator() {
     assert_eq!(original.state.post_state_hash, round.state.post_state_hash);
     assert_eq!(original.state.block_number, round.state.block_number);
     assert_eq!(original.state.bonds.len(), round.state.bonds.len());
-    assert_eq!(original.deploys.len(), round.deploys.len());
+    assert_eq!(original.deploys, round.deploys);
     assert_eq!(original.system_deploys.len(), round.system_deploys.len());
 
     // Recovered content_hash is deterministic from the new content

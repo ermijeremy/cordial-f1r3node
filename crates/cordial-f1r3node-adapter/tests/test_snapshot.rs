@@ -6,7 +6,8 @@ use cordial_miners_core::Block;
 use cordial_miners_core::blocklace::Blocklace;
 use cordial_miners_core::crypto::hash_content;
 use cordial_miners_core::execution::{
-    BlockState, Bond as CmBond, CordialBlockPayload, Deploy, ProcessedDeploy, SignedDeploy,
+    BlockState, Bond as CmBond, CordialBlockPayload, Deploy, DeploySignatureAlgorithm,
+    ProcessedDeploy, SignedDeploy,
 };
 use cordial_miners_core::types::{BlockContent, BlockIdentity, NodeId};
 
@@ -512,6 +513,7 @@ fn deploys_in_scope_collects_from_tip_ancestry() {
         },
         deployer: vec![0x01; 32],
         signature: deploy_sig.clone(),
+        signature_algorithm: DeploySignatureAlgorithm::Secp256k1,
     };
     let processed = ProcessedDeploy {
         deploy: signed,

@@ -77,7 +77,7 @@ The split exists so consumers who only want consensus pay nothing for f1r3node i
 
 **Implementation.** `F1r3RspaceRuntime::execute_block` calls `compute_state_with_bonds`, translates the returned host bonds with checked `i64` to `u64` conversion, and sorts them by validator identity before assigning `ExecutionResult.new_bonds`. Runtime and bond-query failures are propagated.
 
-**Remaining integration coverage.** Extend the real RSpace harness with a successful slash and assert that the validator no longer appears in `result.new_bonds`.
+**Integration coverage.** The ignored real-RSpace suite includes a successful slash and asserts that the affected validator is absent from `new_bonds` or has zero effective stake. Validator registration is not represented by the current core `SystemDeployRequest` API.
 
 ---
 

@@ -6,9 +6,9 @@ use cordial_miners_core::blocklace::Blocklace;
 use cordial_miners_core::consensus::{CordialEvidencePool, EvidencePool, select_predecessors};
 use cordial_miners_core::crypto::{CryptoVerifier, hash_content};
 use cordial_miners_core::execution::{
-    Bond, CordialBlockPayload, Deploy, DeployPool, DeployPoolConfig, ExecutionRequest,
-    ExecutionResult, MockRuntime, ProcessedSystemDeploy, RuntimeError, RuntimeManager,
-    SignedDeploy, SystemDeployRequest, compute_deploys_in_scope,
+    Bond, CordialBlockPayload, Deploy, DeployPool, DeployPoolConfig, DeploySignatureAlgorithm,
+    ExecutionRequest, ExecutionResult, MockRuntime, ProcessedSystemDeploy, RuntimeError,
+    RuntimeManager, SignedDeploy, SystemDeployRequest, compute_deploys_in_scope,
 };
 use cordial_miners_core::types::{BlockContent, BlockIdentity, NodeId};
 
@@ -124,6 +124,7 @@ fn make_deploy(sig_byte: u8) -> SignedDeploy {
         },
         deployer: vec![sig_byte; 32],
         signature: vec![sig_byte; 64],
+        signature_algorithm: DeploySignatureAlgorithm::Secp256k1,
     }
 }
 
