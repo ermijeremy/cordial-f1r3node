@@ -175,7 +175,7 @@ impl<V, P, Id> GrpcBlockMapper<V, P, Id> {
     /// network protobuf messages must use [`Self::from_protobuf`] so their
     /// f1r3node wire hash and signature are verified before translation.
     pub fn from_adapter_message(&self, block_msg: &AdapterBlockMessage) -> Result<Block> {
-        let block = message_to_block(block_msg)
+        let mut block = message_to_block(block_msg)
             .map_err(|e| anyhow!("Failed to translate adapter BlockMessage to Block: {e:?}"))?;
 
         // 2. Extract signature algorithm (case-insensitive, default to secp256k1)
@@ -197,6 +197,13 @@ impl<V, P, Id> GrpcBlockMapper<V, P, Id> {
 
         // 5. Validate parent references
         self.validate_parents(&block)?;
+
+        // BlockMessage predecessor references contain only hash and creator,
+        // not the predecessor's signature. Normalize this compatibility path
+        // to the same signature-free identity domain as `from_protobuf` after
+        // authenticating the message. This happens before mirror insertion;
+        // the mirror itself never rewrites signed BlockContent.
+        block.identity.signature.clear();
 
         Ok(block)
     }

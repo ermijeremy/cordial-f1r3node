@@ -16,6 +16,12 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 ///  - CHAIN: all blocks from a correct node are totally ordered under  ≺
 pub struct Blocklace {
     pub(crate) blocks: HashMap<BlockIdentity, BlockContent>,
+    /// Missing predecessors accepted explicitly at a bounded-view boundary.
+    ///
+    /// The canonical block content is never rewritten. This side metadata
+    /// records which predecessor identities were outside the imported window
+    /// when a block was admitted.
+    trusted_boundary_predecessors: HashMap<BlockIdentity, HashSet<BlockIdentity>>,
     pub(crate) checkpoint: Option<BlockIdentity>,
     pub(crate) checkpoint_depth: Option<u64>,
     pub(crate) checkpoint_order_prefix: Vec<BlockIdentity>,
@@ -29,6 +35,7 @@ impl Blocklace {
     pub fn new() -> Self {
         Self {
             blocks: HashMap::new(),
+            trusted_boundary_predecessors: HashMap::new(),
             checkpoint: None,
             checkpoint_depth: None,
             checkpoint_order_prefix: Vec::new(),
@@ -68,6 +75,12 @@ impl Blocklace {
         );
         #[cfg(feature = "trace")]
         let inserted_id = id.clone();
+        self.trusted_boundary_predecessors.remove(&id);
+        for boundary in self.trusted_boundary_predecessors.values_mut() {
+            boundary.remove(&id);
+        }
+        self.trusted_boundary_predecessors
+            .retain(|_, boundary| !boundary.is_empty());
         self.blocks.insert(id, content);
         self.generation += 1;
         // This low-level commit API has no local-node, wave, or validator-table
@@ -91,6 +104,7 @@ impl Blocklace {
     pub(crate) fn forget_block(&mut self, id: &BlockIdentity) -> bool {
         let removed = self.blocks.remove(id).is_some();
         if removed {
+            self.trusted_boundary_predecessors.remove(id);
             self.generation += 1;
         }
         removed
@@ -167,6 +181,21 @@ impl Blocklace {
     pub(crate) fn is_checkpoint_boundary(&self, id: &BlockIdentity) -> bool {
         self.checkpoint.as_ref() == Some(id)
     }
+
+    /// Missing predecessor identities explicitly trusted for one bounded-view
+    /// block. These identities remain part of the block's canonical content.
+    pub fn trusted_boundary_predecessors(
+        &self,
+        id: &BlockIdentity,
+    ) -> Option<&HashSet<BlockIdentity>> {
+        self.trusted_boundary_predecessors.get(id)
+    }
+
+    /// Whether this blocklace is a bounded partial view rather than a fully
+    /// closed consensus DAG.
+    pub fn has_trusted_boundaries(&self) -> bool {
+        !self.trusted_boundary_predecessors.is_empty()
+    }
 }
 
 // Insertion and Closure axiom
@@ -218,6 +247,43 @@ impl Blocklace {
         self.commit_validated(block.identity.clone(), block.content);
 
         Ok(())
+    }
+
+    /// Insert a block into a bounded mirror without rewriting signed content.
+    ///
+    /// Missing predecessors are retained in `BlockContent` and recorded as
+    /// explicit boundary metadata. This API is for partial inspection views;
+    /// callers that require a fully closed protocol blocklace must use
+    /// [`Self::insert`].
+    pub fn insert_with_trusted_boundary<V: CryptoVerifier>(
+        &mut self,
+        block: Block,
+        verifier: &V,
+    ) -> Result<HashSet<BlockIdentity>, String> {
+        verifier
+            .verify_block(
+                &block.content,
+                &block.identity.signature,
+                &block.identity.creator,
+            )
+            .map_err(|e| format!("Invalid signature: {e:?}"))?;
+
+        let missing: HashSet<BlockIdentity> = block
+            .content
+            .predecessors
+            .iter()
+            .filter(|pred_id| !self.blocks.contains_key(*pred_id))
+            .cloned()
+            .collect();
+        let id = block.identity.clone();
+
+        self.commit_validated(id.clone(), block.content);
+        if !missing.is_empty() {
+            self.trusted_boundary_predecessors
+                .insert(id, missing.clone());
+        }
+
+        Ok(missing)
     }
     // pub fn insert(&mut self, block: Block) -> Result<(), String> {
     //     for pred_id in &block.content.predecessors {

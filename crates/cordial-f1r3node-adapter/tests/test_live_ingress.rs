@@ -5,7 +5,7 @@ use cordial_f1r3node_adapter::block_translation::{
 };
 use cordial_f1r3node_adapter::grpc_ingest::BlocklaceAdapter;
 use cordial_f1r3node_adapter::live_ingress::{
-    LiveIngress, LiveIngressError, LiveIngressPhase, PorWeightActivationError,
+    LiveIngress, LiveIngressError, LiveIngressPhase, MirrorDisposition, PorWeightActivationError,
 };
 use cordial_f1r3node_adapter::shard_conf::CasperShardConf;
 use cordial_f1r3node_adapter::shared_ordered_output::ReadOrderedOutput;
@@ -176,7 +176,7 @@ fn live_ingress_window_boundary_applies_blocks_with_missing_predecessors() {
     };
     let block = build_test_block_with_predecessors(
         NodeId(creator),
-        [missing_parent].into_iter().collect(),
+        [missing_parent.clone()].into_iter().collect(),
         &signing_key,
         25,
         8,
@@ -195,14 +195,60 @@ fn live_ingress_window_boundary_applies_blocks_with_missing_predecessors() {
         .expect("window boundary ingestion should apply trusted recent block");
     assert_eq!(window_ingress.blocklace().dom().len(), 1);
     assert!(window_ingress.pending_blocks().is_empty());
-    assert!(
+    let mirrored = window_ingress
+        .blocklace()
+        .content(&block.identity)
+        .expect("window block should be mirrored");
+    assert_eq!(mirrored.payload, block.content.payload);
+    assert_eq!(mirrored.predecessors, block.content.predecessors);
+    let expected_boundary = HashSet::from([missing_parent]);
+    assert_eq!(
         window_ingress
             .blocklace()
-            .content(&block.identity)
-            .expect("window block should be mirrored")
-            .predecessors
-            .is_empty()
+            .trusted_boundary_predecessors(&block.identity),
+        Some(&expected_boundary)
     );
+    assert!(window_ingress.blocklace().has_trusted_boundaries());
+    assert!(!window_ingress.blocklace().is_closed());
+}
+
+#[test]
+fn live_ingress_does_not_substitute_same_hash_predecessor_identity() {
+    let parent_signing_key = test_signing_key(15);
+    let parent_creator = test_public_key(&parent_signing_key);
+    let parent = build_test_block_with_predecessors(
+        NodeId(parent_creator.clone()),
+        HashSet::new(),
+        &parent_signing_key,
+        1,
+        1,
+    );
+    let mut alternate_parent = parent.identity.clone();
+    alternate_parent.signature.push(0xff);
+
+    let child_signing_key = test_signing_key(16);
+    let child_creator = test_public_key(&child_signing_key);
+    let child = build_test_block_with_predecessors(
+        NodeId(child_creator),
+        [alternate_parent.clone()].into_iter().collect(),
+        &child_signing_key,
+        2,
+        2,
+    );
+
+    let mut ingress = LiveIngress::new(RecordingAdapter::default());
+    ingress.ingest_trusted_block(parent).unwrap();
+    let update = ingress.ingest_trusted_block(child.clone()).unwrap();
+
+    assert_eq!(update.disposition, MirrorDisposition::Buffered);
+    let pending = &ingress
+        .pending_blocks()
+        .get(&child.identity)
+        .expect("child should remain pending")
+        .content;
+    assert_eq!(pending.payload, child.content.payload);
+    assert_eq!(pending.predecessors, child.content.predecessors);
+    assert!(child.content.predecessors.contains(&alternate_parent));
 }
 
 #[test]

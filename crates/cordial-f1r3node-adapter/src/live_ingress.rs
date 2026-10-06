@@ -215,8 +215,6 @@ where
     }
 
     pub fn ingest(&mut self, block: Block) -> Result<MirrorUpdate, String> {
-        let block = self.canonicalize_block(block);
-
         if self.blocklace.get(&block.identity).is_some() {
             return Ok(MirrorUpdate {
                 disposition: MirrorDisposition::Duplicate,
@@ -249,8 +247,6 @@ where
     }
 
     pub fn ingest_with_trusted_boundary(&mut self, block: Block) -> Result<MirrorUpdate, String> {
-        let mut block = self.canonicalize_block(block);
-
         if self.blocklace.get(&block.identity).is_some() {
             return Ok(MirrorUpdate {
                 disposition: MirrorDisposition::Duplicate,
@@ -265,12 +261,8 @@ where
             });
         }
 
-        block
-            .content
-            .predecessors
-            .retain(|pred_id| self.resolve_known_identity(pred_id).is_some());
-
-        self.blocklace.insert(block, &self.verifier)?;
+        self.blocklace
+            .insert_with_trusted_boundary(block, &self.verifier)?;
         let released_from_buffer = self.release_pending()?;
 
         Ok(MirrorUpdate {
@@ -284,7 +276,7 @@ where
             .content
             .predecessors
             .iter()
-            .all(|pred_id| self.resolve_known_identity(pred_id).is_some())
+            .all(|pred_id| self.blocklace.content(pred_id).is_some())
     }
 
     fn release_pending(&mut self) -> Result<usize, String> {
@@ -307,54 +299,12 @@ where
                     .pending
                     .remove(&id)
                     .expect("ready pending block should still exist");
-                let block = self.canonicalize_block(block);
                 self.blocklace.insert(block, &self.verifier)?;
                 released += 1;
             }
         }
 
         Ok(released)
-    }
-
-    fn canonicalize_block(&self, mut block: Block) -> Block {
-        block.content.predecessors = block
-            .content
-            .predecessors
-            .iter()
-            .map(|pred_id| {
-                self.resolve_known_identity(pred_id)
-                    .unwrap_or_else(|| pred_id.clone())
-            })
-            .collect();
-        block
-    }
-
-    fn resolve_known_identity(&self, pred_id: &BlockIdentity) -> Option<BlockIdentity> {
-        let exact = self
-            .blocklace
-            .dom()
-            .into_iter()
-            .find(|known| {
-                known.content_hash == pred_id.content_hash && known.creator == pred_id.creator
-            })
-            .cloned();
-
-        if exact.is_some() {
-            return exact;
-        }
-
-        let mut same_hash = self
-            .blocklace
-            .dom()
-            .into_iter()
-            .filter(|known| known.content_hash == pred_id.content_hash)
-            .cloned();
-        let first = same_hash.next()?;
-        if same_hash.next().is_none() {
-            Some(first)
-        } else {
-            None
-        }
     }
 }
 
