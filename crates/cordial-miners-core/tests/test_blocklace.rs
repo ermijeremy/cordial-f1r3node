@@ -40,6 +40,48 @@ fn insert(b1: &mut Blocklace, block: cordial_miners_core::Block) {
     b1.insert(block, &verifier).expect("insert failed");
 }
 
+#[test]
+fn unsigned_predecessor_reference_resolves_to_unique_signed_identity() {
+    let mut blocklace = Blocklace::new();
+    let mut parent = create_mock_block(1, 1, HashSet::new());
+    parent.identity.signature = vec![0xaa];
+    insert(&mut blocklace, parent.clone());
+
+    let mut unsigned_parent = parent.identity.clone();
+    unsigned_parent.signature.clear();
+    let child = create_mock_block(2, 2, HashSet::from([unsigned_parent.clone()]));
+
+    insert(&mut blocklace, child.clone());
+
+    assert_eq!(
+        blocklace.resolve_identity(&unsigned_parent),
+        Some(&parent.identity)
+    );
+    assert_eq!(
+        blocklace.predecessors(&child.identity),
+        HashSet::from([parent])
+    );
+    assert!(blocklace.is_closed());
+}
+
+#[test]
+fn unsigned_predecessor_reference_does_not_collapse_ambiguous_identities() {
+    let mut blocklace = Blocklace::new();
+    let mut first = create_mock_block(1, 1, HashSet::new());
+    first.identity.signature = vec![0xaa];
+    let mut second = first.clone();
+    second.identity.signature = vec![0xbb];
+    insert(&mut blocklace, first.clone());
+    insert(&mut blocklace, second);
+
+    let mut unsigned_parent = first.identity;
+    unsigned_parent.signature.clear();
+    let child = create_mock_block(2, 2, HashSet::from([unsigned_parent.clone()]));
+
+    assert!(blocklace.resolve_identity(&unsigned_parent).is_none());
+    assert!(blocklace.insert(child, &MockVerifier).is_err());
+}
+
 // closure axiom test: inserting a block with unknown predecessor should fail
 #[test]
 fn genesis_can_be_inserted_into_empty_blocklace() {

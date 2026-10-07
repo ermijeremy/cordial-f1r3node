@@ -136,15 +136,42 @@ impl Default for Blocklace {
 impl Blocklace {
     /// B(b) - get the content of a block by its identity.
     pub fn content(&self, id: &BlockIdentity) -> Option<&BlockContent> {
-        self.blocks.get(id)
+        let resolved = self.resolve_identity(id)?;
+        self.blocks.get(resolved)
     }
 
     /// B[b] - get the full block (identity + content) by identity.
     pub fn get(&self, id: &BlockIdentity) -> Option<Block> {
-        self.blocks.get(id).map(|content| Block {
-            identity: id.clone(),
+        let resolved = self.resolve_identity(id)?;
+        self.blocks.get(resolved).map(|content| Block {
+            identity: resolved.clone(),
             content: content.clone(),
         })
+    }
+
+    /// Resolve a predecessor reference to a stored block identity.
+    ///
+    /// Some transport formats identify predecessors by content hash and
+    /// creator but do not carry the predecessor signature. An empty-signature
+    /// reference may therefore resolve to a stored full identity only when
+    /// that match is unique. Non-empty signatures always require an exact
+    /// identity match, and ambiguous unsigned references remain unresolved.
+    pub fn resolve_identity(&self, id: &BlockIdentity) -> Option<&BlockIdentity> {
+        if let Some((stored, _)) = self.blocks.get_key_value(id) {
+            return Some(stored);
+        }
+        if !id.signature.is_empty() {
+            return None;
+        }
+
+        let mut matches = self.blocks.keys().filter(|candidate| {
+            candidate.content_hash == id.content_hash && candidate.creator == id.creator
+        });
+        let resolved = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(resolved)
     }
     /// B[P] - get all blocks whose ids are in the set P>
     pub fn get_set(&self, ids: &HashSet<BlockIdentity>) -> HashSet<Block> {
@@ -216,7 +243,7 @@ impl Blocklace {
             .content
             .predecessors
             .iter()
-            .filter(|pred_id| !self.blocks.contains_key(*pred_id))
+            .filter(|pred_id| self.resolve_identity(pred_id).is_none())
             .collect();
 
         if !missing.is_empty() {
@@ -272,7 +299,7 @@ impl Blocklace {
             .content
             .predecessors
             .iter()
-            .filter(|pred_id| !self.blocks.contains_key(*pred_id))
+            .filter(|pred_id| self.resolve_identity(pred_id).is_none())
             .cloned()
             .collect();
         let id = block.identity.clone();
@@ -303,7 +330,7 @@ impl Blocklace {
                 || content
                     .predecessors
                     .iter()
-                    .all(|pred_id| self.blocks.contains_key(pred_id))
+                    .all(|pred_id| self.resolve_identity(pred_id).is_some())
         })
     }
 }
@@ -335,8 +362,10 @@ impl Blocklace {
 
             if let Some(content) = self.content(&current_id) {
                 for pred_id in &content.predecessors {
-                    if self.blocks.contains_key(pred_id) && visited.insert(pred_id.clone()) {
-                        queue.push(pred_id.clone());
+                    if let Some(resolved) = self.resolve_identity(pred_id)
+                        && visited.insert(resolved.clone())
+                    {
+                        queue.push(resolved.clone());
                     }
                 }
             }
@@ -348,9 +377,9 @@ impl Blocklace {
         let mut visited = BTreeSet::new();
         let mut queue = VecDeque::new();
 
-        if !self.blocks.contains_key(from) {
+        let Some(from) = self.resolve_identity(from) else {
             return visited;
-        }
+        };
 
         // Start from the block itself (inclusive closure)
         queue.push_back(from.clone());
@@ -364,8 +393,10 @@ impl Blocklace {
             if let Some(content) = self.content(&current_id) {
                 for pred_id in &content.predecessors {
                     // BTreeSet.insert returns false if the item was already present
-                    if self.blocks.contains_key(pred_id) && visited.insert(pred_id.clone()) {
-                        queue.push_back(pred_id.clone());
+                    if let Some(resolved) = self.resolve_identity(pred_id)
+                        && visited.insert(resolved.clone())
+                    {
+                        queue.push_back(resolved.clone());
                     }
                 }
             }

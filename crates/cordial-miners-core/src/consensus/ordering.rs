@@ -134,6 +134,14 @@ pub fn approved_blocks_for_leader(blocklace: &Blocklace, leader: &BlockIdentity)
 pub fn xsort(blocks: &HashSet<Block>) -> Result<Vec<BlockIdentity>, OrderingError> {
     let block_ids: HashSet<BlockIdentity> =
         blocks.iter().map(|block| block.identity.clone()).collect();
+    let mut unsigned_identity_index: HashMap<([u8; 32], NodeId), Option<BlockIdentity>> =
+        HashMap::new();
+    for id in &block_ids {
+        unsigned_identity_index
+            .entry((id.content_hash, id.creator.clone()))
+            .and_modify(|resolved| *resolved = None)
+            .or_insert_with(|| Some(id.clone()));
+    }
     let mut dependents: HashMap<BlockIdentity, Vec<BlockIdentity>> = HashMap::new();
     let mut indegree: HashMap<BlockIdentity, usize> = HashMap::new();
 
@@ -141,15 +149,23 @@ pub fn xsort(blocks: &HashSet<Block>) -> Result<Vec<BlockIdentity>, OrderingErro
         let id = block.identity.clone();
         indegree.entry(id.clone()).or_insert(0);
 
-        for predecessor in &block.content.predecessors {
-            if !block_ids.contains(predecessor) {
+        for predecessor_reference in &block.content.predecessors {
+            let predecessor = if block_ids.contains(predecessor_reference) {
+                predecessor_reference.clone()
+            } else if predecessor_reference.signature.is_empty() {
+                let key = (
+                    predecessor_reference.content_hash,
+                    predecessor_reference.creator.clone(),
+                );
+                let Some(Some(resolved)) = unsigned_identity_index.get(&key) else {
+                    continue;
+                };
+                resolved.clone()
+            } else {
                 continue;
-            }
+            };
 
-            dependents
-                .entry(predecessor.clone())
-                .or_default()
-                .push(id.clone());
+            dependents.entry(predecessor).or_default().push(id.clone());
             *indegree.entry(id.clone()).or_insert(0) += 1;
         }
     }
