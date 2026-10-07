@@ -547,7 +547,10 @@ fn deploy_to_f1r3node(d: CmDeploy) -> Result<DeployData, TranslationError> {
             "deploy.valid_after_block_number",
         )?,
         shard_id: d.shard_id,
-        expiration_timestamp: None, // blocklace Deploy doesn't carry this yet
+        expiration_timestamp: d
+            .expiration_timestamp
+            .map(|value| u64_to_i64(value, "deploy.expiration_timestamp"))
+            .transpose()?,
     })
 }
 
@@ -562,6 +565,10 @@ fn deploy_from_f1r3node(d: &DeployData) -> Result<CmDeploy, TranslationError> {
             "deploy.valid_after_block_number",
         )?,
         shard_id: d.shard_id.clone(),
+        expiration_timestamp: d
+            .expiration_timestamp
+            .map(|value| i64_to_u64(value, "deploy.expiration_timestamp"))
+            .transpose()?,
     })
 }
 
@@ -627,6 +634,7 @@ fn rejected_deploy_from_f1r3node(rd: &RejectedDeploy) -> CmRejectedDeploy {
                 phlo_limit: 0,
                 valid_after_block_number: 0,
                 shard_id: String::new(),
+                expiration_timestamp: None,
             },
             deployer: vec![],
             signature: rd.sig.clone(),

@@ -510,6 +510,7 @@ fn deploys_in_scope_collects_from_tip_ancestry() {
             phlo_limit: 100,
             valid_after_block_number: 0,
             shard_id: "root".to_string(),
+            expiration_timestamp: None,
         },
         deployer: vec![0x01; 32],
         signature: deploy_sig.clone(),

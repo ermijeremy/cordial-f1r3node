@@ -20,6 +20,7 @@ fn make_deploy(sig_byte: u8, term: &[u8], phlo_limit: u64) -> SignedDeploy {
             phlo_limit,
             valid_after_block_number: 0,
             shard_id: "root".to_string(),
+            expiration_timestamp: None,
         },
         deployer: vec![sig_byte; 32],
         signature: vec![sig_byte; 64],

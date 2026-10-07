@@ -75,6 +75,12 @@ pub struct Deploy {
 
     /// Shard identifier this deploy targets.
     pub shard_id: String,
+
+    /// Optional timestamp after which the deploy is no longer valid.
+    ///
+    /// This is part of the signed host `DeployData` and must survive adapter
+    /// translation unchanged for signature verification to remain valid.
+    pub expiration_timestamp: Option<u64>,
 }
 
 /// Signature scheme attached to a deploy at its trust boundary.

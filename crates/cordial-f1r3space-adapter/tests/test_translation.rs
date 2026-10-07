@@ -20,8 +20,9 @@ use cordial_f1r3space_adapter::{
 };
 
 use casper::rust::util::rholang::system_deploy_enum::SystemDeployEnum;
+use crypto::rust::signatures::{secp256k1::Secp256k1, signed::Signed};
 use models::rust::casper::protocol::casper_message::{
-    Bond as F1r3Bond, ProcessedDeploy as F1r3ProcessedDeploy,
+    Bond as F1r3Bond, DeployData as F1r3DeployData, ProcessedDeploy as F1r3ProcessedDeploy,
     ProcessedSystemDeploy as F1r3ProcessedSystemDeploy, SystemDeployData,
 };
 
@@ -46,6 +47,12 @@ fn sample_signed_deploy(sig_byte: u8) -> SignedDeploy {
             phlo_limit: u64::try_from(host.data.phlo_limit).unwrap(),
             valid_after_block_number: u64::try_from(host.data.valid_after_block_number).unwrap(),
             shard_id: host.data.shard_id,
+            expiration_timestamp: host
+                .data
+                .expiration_timestamp
+                .map(u64::try_from)
+                .transpose()
+                .unwrap(),
         },
         deployer: host.pk.bytes.to_vec(),
         signature: host.sig.to_vec(),
@@ -123,6 +130,47 @@ fn signed_deploy_translates_preserving_signature() {
     assert_eq!(f1.sig.to_vec(), expected_signature);
     assert_eq!(f1.pk.bytes.to_vec(), expected_deployer);
     assert_eq!(f1.sig_algorithm.name(), "secp256k1");
+}
+
+#[test]
+fn signed_deploy_with_expiration_timestamp_verifies_and_preserves_it() {
+    let expiration_timestamp = 1_800_000_000_000i64;
+    let host = Signed::create(
+        F1r3DeployData {
+            term: "@0!(\"expiring\")".to_owned(),
+            time_stamp: 1_700_000_000_000,
+            phlo_price: 1,
+            phlo_limit: 10_000,
+            valid_after_block_number: 0,
+            shard_id: "root".to_owned(),
+            expiration_timestamp: Some(expiration_timestamp),
+        },
+        Box::new(Secp256k1),
+        casper::rust::util::construct_deploy::DEFAULT_SEC.clone(),
+    )
+    .expect("fixture deploy should sign");
+    let ours = SignedDeploy {
+        deploy: Deploy {
+            term: host.data.term.as_bytes().to_vec(),
+            timestamp: u64::try_from(host.data.time_stamp).unwrap(),
+            phlo_price: u64::try_from(host.data.phlo_price).unwrap(),
+            phlo_limit: u64::try_from(host.data.phlo_limit).unwrap(),
+            valid_after_block_number: u64::try_from(host.data.valid_after_block_number).unwrap(),
+            shard_id: host.data.shard_id.clone(),
+            expiration_timestamp: Some(u64::try_from(expiration_timestamp).unwrap()),
+        },
+        deployer: host.pk.bytes.to_vec(),
+        signature: host.sig.to_vec(),
+        signature_algorithm: DeploySignatureAlgorithm::Secp256k1,
+    };
+
+    let translated =
+        signed_deploy_to_f1r3node(&ours).expect("the original signed data should still verify");
+
+    assert_eq!(
+        translated.data.expiration_timestamp,
+        Some(expiration_timestamp)
+    );
 }
 
 #[test]
@@ -283,6 +331,10 @@ fn processed_deploy_round_trips_through_f1r3node_types() {
     assert_eq!(ours.deploy.deploy.term, b"@0!(\"hello\")");
     assert_eq!(ours.deploy.deployer, expected_deployer);
     assert_eq!(ours.deploy.signature, expected_signature);
+    assert_eq!(
+        ours.deploy.deploy.expiration_timestamp,
+        sd.deploy.expiration_timestamp
+    );
     assert_eq!(
         ours.deploy.signature_algorithm,
         DeploySignatureAlgorithm::Secp256k1

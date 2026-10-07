@@ -40,6 +40,7 @@ fn build_test_block(num_deploys: usize) -> Block {
                     phlo_limit: 10_000,
                     valid_after_block_number: 0,
                     shard_id: "root".to_string(),
+                    expiration_timestamp: None,
                 },
                 deployer: vec![0xAA; 32],
                 signature: vec![0xBB; 64],

@@ -68,6 +68,7 @@ fn sample_payload() -> CordialBlockPayload {
                     phlo_limit: 10_000,
                     valid_after_block_number: 0,
                     shard_id: "root".to_string(),
+                    expiration_timestamp: Some(1_800_000_000_000),
                 },
                 deployer: vec![0xaa; 32],
                 signature: vec![0xbb; 64],
@@ -137,6 +138,10 @@ fn body_fields_mirror_payload() {
     assert_eq!(msg.body.deploys[0].cost, 100);
     assert!(!msg.body.deploys[0].is_failed);
     assert_eq!(msg.body.deploys[0].deploy.sig_algorithm, "ed25519");
+    assert_eq!(
+        msg.body.deploys[0].deploy.data.expiration_timestamp,
+        Some(1_800_000_000_000)
+    );
 
     assert_eq!(msg.body.system_deploys.len(), 1);
     assert!(matches!(

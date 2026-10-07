@@ -48,6 +48,7 @@ fn sample_deploy() -> SignedDeploy {
             phlo_limit: 10000,
             valid_after_block_number: 0,
             shard_id: "root".to_string(),
+            expiration_timestamp: None,
         },
         deployer: vec![0x01; 32],
         signature: vec![0xab; 64],

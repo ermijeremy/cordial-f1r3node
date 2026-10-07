@@ -148,6 +148,12 @@ fn signed_deploy_at(term: &str, ts_offset: u64) -> SignedDeploy {
             phlo_limit: u64::try_from(host.data.phlo_limit).unwrap(),
             valid_after_block_number: u64::try_from(host.data.valid_after_block_number).unwrap(),
             shard_id: host.data.shard_id,
+            expiration_timestamp: host
+                .data
+                .expiration_timestamp
+                .map(u64::try_from)
+                .transpose()
+                .unwrap(),
         },
         deployer: host.pk.bytes.to_vec(),
         signature: host.sig.to_vec(),

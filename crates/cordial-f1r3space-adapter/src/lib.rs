@@ -234,7 +234,12 @@ pub fn signed_deploy_to_f1r3node(sd: &CmSignedDeploy) -> Result<Signed<DeployDat
         valid_after_block_number: i64::try_from(sd.deploy.valid_after_block_number)
             .map_err(|_| RuntimeError::InternalError("valid_after overflow".into()))?,
         shard_id: sd.deploy.shard_id.clone(),
-        expiration_timestamp: None,
+        expiration_timestamp: sd
+            .deploy
+            .expiration_timestamp
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| RuntimeError::InternalError("expiration_timestamp overflow".into()))?,
     };
 
     let sig_algorithm: Box<dyn SignaturesAlg> = match &sd.signature_algorithm {
@@ -315,6 +320,13 @@ pub fn processed_deploy_from_f1r3node(
             valid_after_block_number: u64::try_from(pd.deploy.data.valid_after_block_number)
                 .unwrap_or(0),
             shard_id: pd.deploy.data.shard_id.clone(),
+            expiration_timestamp: pd
+                .deploy
+                .data
+                .expiration_timestamp
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| RuntimeError::InvalidDeploy("negative expiration_timestamp".into()))?,
         },
         deployer: pd.deploy.pk.bytes.to_vec(),
         signature: pd.deploy.sig.to_vec(),
@@ -371,6 +383,7 @@ fn rejected_deploy_placeholder(sig: Vec<u8>) -> RejectedDeploy {
                 phlo_limit: 0,
                 valid_after_block_number: 0,
                 shard_id: String::new(),
+                expiration_timestamp: None,
             },
             deployer: vec![],
             signature: sig,

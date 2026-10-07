@@ -502,6 +502,17 @@ where
         &self,
         deploy: SignedDeployData,
     ) -> Result<Either<DeployError, DeployId>, CasperError> {
+        let expiration_timestamp = match deploy.data.expiration_timestamp {
+            Some(value) => match u64::try_from(value) {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    return Ok(Either::Left(DeployError::ParsingError(
+                        "negative expiration timestamp".into(),
+                    )));
+                }
+            },
+            None => None,
+        };
         // Translate the wire deploy into our core type
         let cm_signed = CmSignedDeploy {
             deploy: cordial_miners_core::execution::Deploy {
@@ -512,6 +523,7 @@ where
                 valid_after_block_number: u64::try_from(deploy.data.valid_after_block_number)
                     .unwrap_or(0),
                 shard_id: deploy.data.shard_id.clone(),
+                expiration_timestamp,
             },
             deployer: deploy.pk.clone(),
             signature: deploy.sig.clone(),
