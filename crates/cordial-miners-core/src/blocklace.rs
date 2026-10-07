@@ -423,6 +423,9 @@ impl Blocklace {
 
     /// Check if a < b - a is somewhere in b's ancestry
     pub fn precedes(&self, a: &BlockIdentity, b: &BlockIdentity) -> bool {
+        let Some(a) = self.resolve_identity(a) else {
+            return false;
+        };
         self.ancestors(b.clone())
             .iter()
             .any(|block| &block.identity == a)
@@ -430,7 +433,10 @@ impl Blocklace {
 
     /// Check if a ⪯ b - a  preceeds b or is equal to b
     pub fn preceedes_or_equals(&self, a: &BlockIdentity, b: &BlockIdentity) -> bool {
-        a == b || self.precedes(a, b)
+        match (self.resolve_identity(a), self.resolve_identity(b)) {
+            (Some(a), Some(b)) => a == b || self.precedes(a, b),
+            _ => false,
+        }
     }
 }
 
