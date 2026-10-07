@@ -300,6 +300,51 @@ fn trusted_boundary_records_only_missing_predecessors_without_rewriting_content(
 }
 
 #[test]
+fn unsigned_trusted_boundary_clears_when_signed_parent_arrives() {
+    let parent_key = test_signing_key(19);
+    let parent = build_test_block_with_predecessors(
+        NodeId(test_public_key(&parent_key)),
+        HashSet::new(),
+        &parent_key,
+        1,
+        1,
+    );
+    let mut unsigned_parent = parent.identity.clone();
+    unsigned_parent.signature.clear();
+
+    let child_key = test_signing_key(20);
+    let child = build_test_block_with_predecessors(
+        NodeId(test_public_key(&child_key)),
+        HashSet::from([unsigned_parent.clone()]),
+        &child_key,
+        2,
+        2,
+    );
+
+    let mut ingress = LiveIngress::new(RecordingAdapter::default());
+    ingress
+        .ingest_trusted_window_block(child.clone())
+        .expect("bounded child should be admitted");
+    assert_eq!(
+        ingress
+            .blocklace()
+            .trusted_boundary_predecessors(&child.identity),
+        Some(&HashSet::from([unsigned_parent]))
+    );
+
+    ingress
+        .ingest_trusted_block(parent.clone())
+        .expect("signed parent should be admitted");
+
+    assert!(!ingress.blocklace().has_trusted_boundaries());
+    assert!(ingress.blocklace().is_closed());
+    assert_eq!(
+        ingress.blocklace().predecessors(&child.identity),
+        HashSet::from([parent])
+    );
+}
+
+#[test]
 fn live_ingress_ignores_duplicate_blocks_in_mirror_state() {
     let signing_key = test_signing_key(13);
     let creator = test_public_key(&signing_key);

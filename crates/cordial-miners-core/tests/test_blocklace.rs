@@ -82,6 +82,36 @@ fn unsigned_predecessor_reference_does_not_collapse_ambiguous_identities() {
     assert!(blocklace.insert(child, &MockVerifier).is_err());
 }
 
+#[test]
+fn later_identity_variant_cannot_invalidate_admitted_unsigned_edge() {
+    let mut blocklace = Blocklace::new();
+    let mut parent = create_mock_block(1, 1, HashSet::new());
+    parent.identity.signature = vec![0xaa];
+    insert(&mut blocklace, parent.clone());
+
+    let mut unsigned_parent = parent.identity.clone();
+    unsigned_parent.signature.clear();
+    let child = create_mock_block(2, 2, HashSet::from([unsigned_parent.clone()]));
+    insert(&mut blocklace, child.clone());
+
+    let mut alternate_parent = parent.clone();
+    alternate_parent.identity.signature = vec![0xbb];
+    let error = blocklace
+        .insert(alternate_parent, &MockVerifier)
+        .expect_err("a second resolution target must be rejected");
+
+    assert!(error.contains("would make an unsigned predecessor reference ambiguous"));
+    assert_eq!(
+        blocklace.resolve_identity(&unsigned_parent),
+        Some(&parent.identity)
+    );
+    assert_eq!(
+        blocklace.predecessors(&child.identity),
+        HashSet::from([parent])
+    );
+    assert!(blocklace.is_closed());
+}
+
 // closure axiom test: inserting a block with unknown predecessor should fail
 #[test]
 fn genesis_can_be_inserted_into_empty_blocklace() {

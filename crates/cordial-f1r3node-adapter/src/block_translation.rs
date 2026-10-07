@@ -187,6 +187,10 @@ pub enum TranslationError {
 
     /// A predecessor id could not be reconstructed from the wire hash (length mismatch).
     InvalidPredecessorHash { expected_len: usize, got: usize },
+
+    /// A signed deploy term was not valid UTF-8 and cannot be represented by
+    /// f1r3node without changing the signed bytes.
+    InvalidDeployTermUtf8(String),
 }
 
 /// Convert the real f1r3node model into the adapter's translation model.
@@ -538,7 +542,8 @@ fn bond_from_f1r3node(b: &Bond) -> Result<CmBond, TranslationError> {
 
 fn deploy_to_f1r3node(d: CmDeploy) -> Result<DeployData, TranslationError> {
     Ok(DeployData {
-        term: String::from_utf8_lossy(&d.term).into_owned(),
+        term: String::from_utf8(d.term)
+            .map_err(|error| TranslationError::InvalidDeployTermUtf8(error.to_string()))?,
         time_stamp: u64_to_i64(d.timestamp, "deploy.timestamp")?,
         phlo_price: u64_to_i64(d.phlo_price, "deploy.phlo_price")?,
         phlo_limit: u64_to_i64(d.phlo_limit, "deploy.phlo_limit")?,

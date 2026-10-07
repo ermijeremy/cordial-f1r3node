@@ -380,6 +380,7 @@ where
             CoreInvalidBlock::InvalidSignature => InvalidBlock::InvalidSignature,
             CoreInvalidBlock::UnknownSender { .. } => InvalidBlock::InvalidSender,
             CoreInvalidBlock::MissingPredecessors { .. } => InvalidBlock::InvalidParents,
+            CoreInvalidBlock::AmbiguousPredecessorIdentity { .. } => InvalidBlock::InvalidParents,
             CoreInvalidBlock::Equivocation { .. } => InvalidBlock::AdmissibleEquivocation,
             CoreInvalidBlock::NotCordial { .. } => InvalidBlock::NotOfInterest,
             CoreInvalidBlock::HiddenEquivocation { .. } => InvalidBlock::HiddenEquivocation,

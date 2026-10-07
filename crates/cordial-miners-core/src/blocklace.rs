@@ -66,7 +66,15 @@ impl Blocklace {
     ///
     /// The caller is responsible for having validated the block; this is the
     /// commit step only.
-    pub(crate) fn commit_validated(&mut self, id: BlockIdentity, content: BlockContent) {
+    pub(crate) fn commit_validated(
+        &mut self,
+        id: BlockIdentity,
+        content: BlockContent,
+    ) -> Result<(), BlockIdentity> {
+        if let Some(conflicting) = self.conflicting_identity_for_unsigned_references(&id) {
+            return Err(conflicting.clone());
+        }
+
         #[cfg(feature = "trace")]
         let (block_hash, creator, parent_hashes) = (
             trace::hex(&id.content_hash),
@@ -76,12 +84,17 @@ impl Blocklace {
         #[cfg(feature = "trace")]
         let inserted_id = id.clone();
         self.trusted_boundary_predecessors.remove(&id);
+        self.blocks.insert(id, content);
+
+        // A newly inserted signed identity may satisfy an unsigned boundary
+        // reference. Clear only references that now resolve uniquely; exact
+        // equality would leave unsigned references behind indefinitely.
+        let blocks = &self.blocks;
         for boundary in self.trusted_boundary_predecessors.values_mut() {
-            boundary.remove(&id);
+            boundary.retain(|pred_id| Self::resolve_identity_in(blocks, pred_id).is_none());
         }
         self.trusted_boundary_predecessors
             .retain(|_, boundary| !boundary.is_empty());
-        self.blocks.insert(id, content);
         self.generation += 1;
         // This low-level commit API has no local-node, wave, or validator-table
         // context. The block creator is therefore the commit actor; absent
@@ -98,6 +111,8 @@ impl Blocklace {
             creator,
             weight_table_hash: None,
         }));
+
+        Ok(())
     }
 
     /// Remove a block, bumping the generation if anything was removed.
@@ -157,14 +172,21 @@ impl Blocklace {
     /// that match is unique. Non-empty signatures always require an exact
     /// identity match, and ambiguous unsigned references remain unresolved.
     pub fn resolve_identity(&self, id: &BlockIdentity) -> Option<&BlockIdentity> {
-        if let Some((stored, _)) = self.blocks.get_key_value(id) {
+        Self::resolve_identity_in(&self.blocks, id)
+    }
+
+    fn resolve_identity_in<'a>(
+        blocks: &'a HashMap<BlockIdentity, BlockContent>,
+        id: &BlockIdentity,
+    ) -> Option<&'a BlockIdentity> {
+        if let Some((stored, _)) = blocks.get_key_value(id) {
             return Some(stored);
         }
         if !id.signature.is_empty() {
             return None;
         }
 
-        let mut matches = self.blocks.keys().filter(|candidate| {
+        let mut matches = blocks.keys().filter(|candidate| {
             candidate.content_hash == id.content_hash && candidate.creator == id.creator
         });
         let resolved = matches.next()?;
@@ -172,6 +194,31 @@ impl Blocklace {
             return None;
         }
         Some(resolved)
+    }
+
+    /// Return the stored identity that would make an already-admitted
+    /// unsigned predecessor reference ambiguous if `id` were inserted.
+    pub(crate) fn conflicting_identity_for_unsigned_references(
+        &self,
+        id: &BlockIdentity,
+    ) -> Option<&BlockIdentity> {
+        // Replacing an exact identity does not add another resolution target.
+        if self.blocks.contains_key(id) {
+            return None;
+        }
+
+        let conflicting = self.blocks.keys().find(|candidate| {
+            candidate.content_hash == id.content_hash && candidate.creator == id.creator
+        })?;
+        let is_referenced_unsigned = self.blocks.values().any(|content| {
+            content.predecessors.iter().any(|pred_id| {
+                pred_id.signature.is_empty()
+                    && pred_id.content_hash == id.content_hash
+                    && pred_id.creator == id.creator
+            })
+        });
+
+        is_referenced_unsigned.then_some(conflicting)
     }
     /// B[P] - get all blocks whose ids are in the set P>
     pub fn get_set(&self, ids: &HashSet<BlockIdentity>) -> HashSet<Block> {
@@ -271,7 +318,12 @@ impl Blocklace {
 
         // 3. Commit to state. The commit method is the single insertion trace
         // site shared with `validated_insert`.
-        self.commit_validated(block.identity.clone(), block.content);
+        self.commit_validated(block.identity.clone(), block.content)
+            .map_err(|conflicting| {
+                format!(
+                    "Identity conflict: insertion would make an unsigned predecessor reference ambiguous with {conflicting:?}"
+                )
+            })?;
 
         Ok(())
     }
@@ -304,7 +356,12 @@ impl Blocklace {
             .collect();
         let id = block.identity.clone();
 
-        self.commit_validated(id.clone(), block.content);
+        self.commit_validated(id.clone(), block.content)
+            .map_err(|conflicting| {
+                format!(
+                    "Identity conflict: insertion would make an unsigned predecessor reference ambiguous with {conflicting:?}"
+                )
+            })?;
         if !missing.is_empty() {
             self.trusted_boundary_predecessors
                 .insert(id, missing.clone());

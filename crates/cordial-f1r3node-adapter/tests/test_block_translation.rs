@@ -324,6 +324,17 @@ fn invalid_payload_bytes_fails_translation() {
 }
 
 #[test]
+fn invalid_utf8_deploy_term_is_rejected_without_rewriting_signed_bytes() {
+    let mut payload = sample_payload();
+    payload.deploys[0].deploy.deploy.term = vec![0xff, 0xfe];
+    let block = build_block(node(1), payload, HashSet::new(), vec![0xff; 64]);
+
+    let err = block_to_message(&block, "root").unwrap_err();
+
+    assert!(matches!(err, TranslationError::InvalidDeployTermUtf8(_)));
+}
+
+#[test]
 fn wrong_predecessor_hash_length_fails_translation() {
     let msg = BlockMessage {
         block_hash: vec![0x00; 32],

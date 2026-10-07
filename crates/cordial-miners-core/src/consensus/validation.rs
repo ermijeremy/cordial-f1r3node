@@ -34,6 +34,10 @@ pub enum InvalidBlock {
     /// One or more predecessor blocks are not in the blocklace (closure violation).
     MissingPredecessors { missing: Vec<BlockIdentity> },
 
+    /// The identity would make an already-admitted unsigned predecessor
+    /// reference ambiguous and retroactively violate closure.
+    AmbiguousPredecessorIdentity { conflicting: BlockIdentity },
+
     /// Inserting this block would violate the chain axiom for the creator.
     /// The creator already has a block that is not comparable to this one.
     Equivocation { conflicting: BlockIdentity },
@@ -182,6 +186,17 @@ pub fn validate_block(
         });
     }
 
+    // Identity resolution for an admitted unsigned predecessor must remain
+    // stable. This structural check is mandatory even when ordinary closure
+    // validation is disabled by configuration.
+    if let Some(conflicting) =
+        blocklace.conflicting_identity_for_unsigned_references(&block.identity)
+    {
+        errors.push(InvalidBlock::AmbiguousPredecessorIdentity {
+            conflicting: conflicting.clone(),
+        });
+    }
+
     // 5. Chain axiom — inserting this block must not create equivocation.
     //
     // Deferred while predecessors are missing: the comparability walk cannot
@@ -288,7 +303,12 @@ pub fn validated_insert(
     let result = validate_block(&block, blocklace, bonds, config);
     if result.is_valid() {
         // Closure is already verified by validation, so commit directly.
-        blocklace.commit_validated(block.identity.clone(), block.content);
+        if let Err(conflicting) = blocklace.commit_validated(block.identity.clone(), block.content)
+        {
+            return ValidationResult::Invalid(vec![InvalidBlock::AmbiguousPredecessorIdentity {
+                conflicting,
+            }]);
+        }
     }
     result
 }
