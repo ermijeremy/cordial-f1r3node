@@ -64,26 +64,7 @@ fn unsigned_predecessor_reference_resolves_to_unique_signed_identity() {
     assert!(blocklace.is_closed());
 }
 
-#[test]
-fn unsigned_predecessor_reference_does_not_collapse_ambiguous_identities() {
-    let mut blocklace = Blocklace::new();
-    let mut first = create_mock_block(1, 1, HashSet::new());
-    first.identity.signature = vec![0xaa];
-    let mut second = first.clone();
-    second.identity.signature = vec![0xbb];
-    insert(&mut blocklace, first.clone());
-    insert(&mut blocklace, second);
-
-    let mut unsigned_parent = first.identity;
-    unsigned_parent.signature.clear();
-    let child = create_mock_block(2, 2, HashSet::from([unsigned_parent.clone()]));
-
-    assert!(blocklace.resolve_identity(&unsigned_parent).is_none());
-    assert!(blocklace.insert(child, &MockVerifier).is_err());
-}
-
-#[test]
-fn later_identity_variant_cannot_invalidate_admitted_unsigned_edge() {
+fn assert_collision_handling_is_independent_of_child_arrival(child_first: bool) {
     let mut blocklace = Blocklace::new();
     let mut parent = create_mock_block(1, 1, HashSet::new());
     parent.identity.signature = vec![0xaa];
@@ -92,7 +73,10 @@ fn later_identity_variant_cannot_invalidate_admitted_unsigned_edge() {
     let mut unsigned_parent = parent.identity.clone();
     unsigned_parent.signature.clear();
     let child = create_mock_block(2, 2, HashSet::from([unsigned_parent.clone()]));
-    insert(&mut blocklace, child.clone());
+
+    if child_first {
+        insert(&mut blocklace, child.clone());
+    }
 
     let mut alternate_parent = parent.clone();
     alternate_parent.identity.signature = vec![0xbb];
@@ -100,7 +84,12 @@ fn later_identity_variant_cannot_invalidate_admitted_unsigned_edge() {
         .insert(alternate_parent, &MockVerifier)
         .expect_err("a second resolution target must be rejected");
 
-    assert!(error.contains("would make an unsigned predecessor reference ambiguous"));
+    assert!(error.contains("content hash and creator already belong to"));
+
+    if !child_first {
+        insert(&mut blocklace, child.clone());
+    }
+
     assert_eq!(
         blocklace.resolve_identity(&unsigned_parent),
         Some(&parent.identity)
@@ -110,6 +99,12 @@ fn later_identity_variant_cannot_invalidate_admitted_unsigned_edge() {
         HashSet::from([parent])
     );
     assert!(blocklace.is_closed());
+}
+
+#[test]
+fn identity_collision_rejection_is_independent_of_unsigned_child_arrival() {
+    assert_collision_handling_is_independent_of_child_arrival(true);
+    assert_collision_handling_is_independent_of_child_arrival(false);
 }
 
 // closure axiom test: inserting a block with unknown predecessor should fail

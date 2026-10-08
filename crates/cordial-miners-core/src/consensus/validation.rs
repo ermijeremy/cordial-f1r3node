@@ -34,9 +34,9 @@ pub enum InvalidBlock {
     /// One or more predecessor blocks are not in the blocklace (closure violation).
     MissingPredecessors { missing: Vec<BlockIdentity> },
 
-    /// The identity would make an already-admitted unsigned predecessor
-    /// reference ambiguous and retroactively violate closure.
-    AmbiguousPredecessorIdentity { conflicting: BlockIdentity },
+    /// Another signature variant already occupies the same content-hash and
+    /// creator identity domain.
+    IdentityCollision { conflicting: BlockIdentity },
 
     /// Inserting this block would violate the chain axiom for the creator.
     /// The creator already has a block that is not comparable to this one.
@@ -186,13 +186,11 @@ pub fn validate_block(
         });
     }
 
-    // Identity resolution for an admitted unsigned predecessor must remain
-    // stable. This structural check is mandatory even when ordinary closure
-    // validation is disabled by configuration.
-    if let Some(conflicting) =
-        blocklace.conflicting_identity_for_unsigned_references(&block.identity)
-    {
-        errors.push(InvalidBlock::AmbiguousPredecessorIdentity {
+    // Unsigned transport references resolve by content hash and creator, so
+    // every blocklace must admit at most one signature variant for that pair.
+    // This structural check is mandatory regardless of validation options.
+    if let Some(conflicting) = blocklace.conflicting_identity_variant(&block.identity) {
+        errors.push(InvalidBlock::IdentityCollision {
             conflicting: conflicting.clone(),
         });
     }
@@ -305,7 +303,7 @@ pub fn validated_insert(
         // Closure is already verified by validation, so commit directly.
         if let Err(conflicting) = blocklace.commit_validated(block.identity.clone(), block.content)
         {
-            return ValidationResult::Invalid(vec![InvalidBlock::AmbiguousPredecessorIdentity {
+            return ValidationResult::Invalid(vec![InvalidBlock::IdentityCollision {
                 conflicting,
             }]);
         }

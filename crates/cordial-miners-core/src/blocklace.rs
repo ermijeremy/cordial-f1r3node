@@ -71,7 +71,7 @@ impl Blocklace {
         id: BlockIdentity,
         content: BlockContent,
     ) -> Result<(), BlockIdentity> {
-        if let Some(conflicting) = self.conflicting_identity_for_unsigned_references(&id) {
+        if let Some(conflicting) = self.conflicting_identity_variant(&id) {
             return Err(conflicting.clone());
         }
 
@@ -196,29 +196,25 @@ impl Blocklace {
         Some(resolved)
     }
 
-    /// Return the stored identity that would make an already-admitted
-    /// unsigned predecessor reference ambiguous if `id` were inserted.
-    pub(crate) fn conflicting_identity_for_unsigned_references(
+    /// Return an existing identity with the same content hash and creator but
+    /// a different signature.
+    ///
+    /// Unsigned transport references identify predecessors by this pair, so
+    /// admitting more than one signature variant would make resolution depend
+    /// on message arrival order. Enforce uniqueness whether or not an unsigned
+    /// reference has already been admitted.
+    pub(crate) fn conflicting_identity_variant(
         &self,
         id: &BlockIdentity,
     ) -> Option<&BlockIdentity> {
-        // Replacing an exact identity does not add another resolution target.
+        // Replacing an exact identity does not create a collision.
         if self.blocks.contains_key(id) {
             return None;
         }
 
-        let conflicting = self.blocks.keys().find(|candidate| {
+        self.blocks.keys().find(|candidate| {
             candidate.content_hash == id.content_hash && candidate.creator == id.creator
-        })?;
-        let is_referenced_unsigned = self.blocks.values().any(|content| {
-            content.predecessors.iter().any(|pred_id| {
-                pred_id.signature.is_empty()
-                    && pred_id.content_hash == id.content_hash
-                    && pred_id.creator == id.creator
-            })
-        });
-
-        is_referenced_unsigned.then_some(conflicting)
+        })
     }
     /// B[P] - get all blocks whose ids are in the set P>
     pub fn get_set(&self, ids: &HashSet<BlockIdentity>) -> HashSet<Block> {
@@ -321,7 +317,7 @@ impl Blocklace {
         self.commit_validated(block.identity.clone(), block.content)
             .map_err(|conflicting| {
                 format!(
-                    "Identity conflict: insertion would make an unsigned predecessor reference ambiguous with {conflicting:?}"
+                    "Identity conflict: content hash and creator already belong to {conflicting:?}"
                 )
             })?;
 
@@ -359,7 +355,7 @@ impl Blocklace {
         self.commit_validated(id.clone(), block.content)
             .map_err(|conflicting| {
                 format!(
-                    "Identity conflict: insertion would make an unsigned predecessor reference ambiguous with {conflicting:?}"
+                    "Identity conflict: content hash and creator already belong to {conflicting:?}"
                 )
             })?;
         if !missing.is_empty() {
