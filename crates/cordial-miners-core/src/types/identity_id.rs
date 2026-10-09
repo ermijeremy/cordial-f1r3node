@@ -22,6 +22,15 @@ pub struct BlockIdentity {
 }
 
 impl BlockIdentity {
+    /// Whether two authenticated identities name the same consensus block.
+    ///
+    /// Signature bytes are proof material and may differ between otherwise
+    /// equivalent identities, so consensus relations compare only the content
+    /// hash and creator.
+    pub fn same_consensus_identity(&self, other: &Self) -> bool {
+        self.content_hash == other.content_hash && self.creator == other.creator
+    }
+
     /// Return the signature-independent identity used by consensus output.
     ///
     /// A signature authenticates a block, but is not a stable semantic name:

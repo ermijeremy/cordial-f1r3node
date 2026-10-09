@@ -128,7 +128,9 @@ pub fn approved_blocks_for_leader(blocklace: &Blocklace, leader: &BlockIdentity)
 /// The order respects predecessor edges within the supplied block set. When
 /// multiple blocks are ready at the same time, ties are broken by the natural
 /// ordering of their signature-independent consensus identities, yielding a
-/// stable result even if nodes retained different valid signature proofs.
+/// stable result even if nodes retained different valid signature proofs. The
+/// returned identities are also projected to that consensus form, so raw core
+/// ordering output does not expose whichever proof happened to arrive first.
 ///
 /// Returns [`OrderingError::CycleDetected`] if the supplied subset contains a
 /// cycle, instead of silently returning a partial order.
@@ -184,7 +186,7 @@ pub fn xsort(blocks: &HashSet<Block>) -> Result<Vec<BlockIdentity>, OrderingErro
     let mut ordered = Vec::with_capacity(blocks.len());
 
     while let Some((_, next)) = ready.pop_first() {
-        ordered.push(next.clone());
+        ordered.push(next.consensus_identity());
 
         if let Some(children) = dependents.get(&next) {
             for child in children {
@@ -715,7 +717,7 @@ where
 
     let newly_approved: HashSet<Block> = approved_blocks_for_leader(blocklace, leader)
         .into_iter()
-        .filter(|block| !state.emitted.contains(&block.identity))
+        .filter(|block| !state.emitted.contains(&block.identity.consensus_identity()))
         .collect();
 
     for id in xsort(&newly_approved)? {
@@ -783,7 +785,7 @@ where
 
     let newly_approved: HashSet<Block> = approved_blocks_for_leader(blocklace, leader)
         .into_iter()
-        .filter(|block| !state.emitted.contains(&block.identity))
+        .filter(|block| !state.emitted.contains(&block.identity.consensus_identity()))
         .collect();
 
     for id in xsort(&newly_approved)? {
@@ -835,8 +837,9 @@ fn emit_checkpoint_prefix(
     }
 
     for id in blocklace.checkpoint_order_prefix() {
+        let id = id.consensus_identity();
         if state.emitted.insert(id.clone()) {
-            state.ordered.push(id.clone());
+            state.ordered.push(id);
         }
     }
 
@@ -855,8 +858,9 @@ fn emit_weighted_checkpoint_prefix(
     }
 
     for id in blocklace.checkpoint_weighted_order_prefix() {
+        let id = id.consensus_identity();
         if state.emitted.insert(id.clone()) {
-            state.ordered.push(id.clone());
+            state.ordered.push(id);
         }
     }
 

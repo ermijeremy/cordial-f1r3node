@@ -136,11 +136,7 @@ fn reversed_signature_arrival_produces_the_same_consensus_order() {
     let consensus_order = |blocklace: &Blocklace| {
         let identities = blocklace.dom().into_iter().cloned().collect();
         let blocks = blocklace.get_set(&identities);
-        xsort(&blocks)
-            .expect("the admitted blocklace must be sortable")
-            .into_iter()
-            .map(|identity| identity.consensus_identity())
-            .collect::<Vec<_>>()
+        xsort(&blocks).expect("the admitted blocklace must be sortable")
     };
 
     assert_eq!(consensus_order(&first), consensus_order(&reversed));

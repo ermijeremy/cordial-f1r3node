@@ -306,7 +306,10 @@ fn weighted_tau_does_not_replay_unweighted_checkpoint_prefix() {
 
     let weighted_after =
         weighted_tau(&blocklace, wavelength, &weights, leader_node1).expect("weighted tau");
-    assert_eq!(weighted_after, vec![graph.w1_leader.identity]);
+    assert_eq!(
+        weighted_after,
+        vec![graph.w1_leader.identity.consensus_identity()]
+    );
     assert_ne!(weighted_after, unweighted_before);
 }
 

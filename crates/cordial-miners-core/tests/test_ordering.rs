@@ -158,7 +158,13 @@ fn xsort_resolves_unique_unsigned_predecessor_references() {
 
     let ordered = xsort(&HashSet::from([child.clone(), parent.clone()])).unwrap();
 
-    assert_eq!(ordered, vec![parent.identity, child.identity]);
+    assert_eq!(
+        ordered,
+        vec![
+            parent.identity.consensus_identity(),
+            child.identity.consensus_identity(),
+        ]
+    );
 }
 
 #[test]
