@@ -1,4 +1,5 @@
 use cordial_miners_core::blocklace::Blocklace;
+use cordial_miners_core::consensus::ordering::xsort;
 use cordial_miners_core::crypto::{CryptoVerifier, Secp256k1Scheme};
 use cordial_miners_core::{Block, BlockContent, BlockIdentity, NodeId};
 use std::collections::HashSet;
@@ -105,6 +106,46 @@ fn assert_collision_handling_is_independent_of_child_arrival(child_first: bool) 
 fn identity_collision_rejection_is_independent_of_unsigned_child_arrival() {
     assert_collision_handling_is_independent_of_child_arrival(true);
     assert_collision_handling_is_independent_of_child_arrival(false);
+}
+
+fn blocklace_after_signature_arrival_order(first_signature: u8, second_signature: u8) -> Blocklace {
+    let mut blocklace = Blocklace::new();
+    let mut parent = create_mock_block(1, 1, HashSet::new());
+    parent.identity.signature = vec![first_signature];
+    insert(&mut blocklace, parent.clone());
+
+    let mut alternate = parent.clone();
+    alternate.identity.signature = vec![second_signature];
+    blocklace
+        .insert(alternate, &MockVerifier)
+        .expect_err("the later signature variant must be rejected");
+
+    let unsigned_parent = parent.identity.consensus_identity();
+    insert(
+        &mut blocklace,
+        create_mock_block(2, 2, HashSet::from([unsigned_parent])),
+    );
+    blocklace
+}
+
+#[test]
+fn reversed_signature_arrival_produces_the_same_consensus_order() {
+    let first = blocklace_after_signature_arrival_order(0xaa, 0xbb);
+    let reversed = blocklace_after_signature_arrival_order(0xbb, 0xaa);
+
+    let consensus_order = |blocklace: &Blocklace| {
+        let identities = blocklace.dom().into_iter().cloned().collect();
+        let blocks = blocklace.get_set(&identities);
+        xsort(&blocks)
+            .expect("the admitted blocklace must be sortable")
+            .into_iter()
+            .map(|identity| identity.consensus_identity())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(consensus_order(&first), consensus_order(&reversed));
+    assert!(first.is_closed());
+    assert!(reversed.is_closed());
 }
 
 // closure axiom test: inserting a block with unknown predecessor should fail

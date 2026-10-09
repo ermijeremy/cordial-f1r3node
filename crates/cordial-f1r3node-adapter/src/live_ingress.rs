@@ -572,6 +572,10 @@ impl<A> LiveIngress<A> {
                 &next_weights,
                 &mut prospective_cache,
             );
+            let prospective: Vec<_> = prospective
+                .into_iter()
+                .map(|identity| identity.consensus_identity())
+                .collect();
             if !prospective.starts_with(&previous.blocks) {
                 return Err(PorWeightActivationError::WouldRewriteFinalizedOutput);
             }
@@ -639,10 +643,10 @@ impl<A> LiveIngress<A> {
     }
 
     /// Return the latest finalized ordered output through the stable
-    /// `ordered_output` export seam: the finalized-prefix blocks (full
-    /// [`BlockIdentity`] entries, not bare hashes), linearized via weighted
-    /// tau ordering, together with the anchor and consensus metadata needed
-    /// to interpret them.
+    /// `ordered_output` export seam: the finalized-prefix blocks
+    /// (signature-independent [`BlockIdentity`] references, not bare hashes),
+    /// linearized via weighted tau ordering, together with the anchor and
+    /// consensus metadata needed to interpret them.
     ///
     /// `anchor` is `None` and `blocks` is empty when the mirrored state does
     /// not yet have a finalized leader.

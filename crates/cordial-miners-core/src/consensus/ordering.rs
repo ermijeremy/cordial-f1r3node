@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 
 use crate::block::Block;
@@ -127,7 +127,8 @@ pub fn approved_blocks_for_leader(blocklace: &Blocklace, leader: &BlockIdentity)
 ///
 /// The order respects predecessor edges within the supplied block set. When
 /// multiple blocks are ready at the same time, ties are broken by the natural
-/// ordering of `BlockIdentity`, yielding a stable result across nodes.
+/// ordering of their signature-independent consensus identities, yielding a
+/// stable result even if nodes retained different valid signature proofs.
 ///
 /// Returns [`OrderingError::CycleDetected`] if the supplied subset contains a
 /// cycle, instead of silently returning a partial order.
@@ -170,13 +171,19 @@ pub fn xsort(blocks: &HashSet<Block>) -> Result<Vec<BlockIdentity>, OrderingErro
         }
     }
 
-    let mut ready: BTreeSet<BlockIdentity> = indegree
+    let mut ready: BTreeMap<BlockIdentity, BlockIdentity> = indegree
         .iter()
-        .filter_map(|(id, degree)| if *degree == 0 { Some(id.clone()) } else { None })
+        .filter_map(|(id, degree)| {
+            if *degree == 0 {
+                Some((id.consensus_identity(), id.clone()))
+            } else {
+                None
+            }
+        })
         .collect();
     let mut ordered = Vec::with_capacity(blocks.len());
 
-    while let Some(next) = ready.pop_first() {
+    while let Some((_, next)) = ready.pop_first() {
         ordered.push(next.clone());
 
         if let Some(children) = dependents.get(&next) {
@@ -184,7 +191,7 @@ pub fn xsort(blocks: &HashSet<Block>) -> Result<Vec<BlockIdentity>, OrderingErro
                 if let Some(degree) = indegree.get_mut(child) {
                     *degree -= 1;
                     if *degree == 0 {
-                        ready.insert(child.clone());
+                        ready.insert(child.consensus_identity(), child.clone());
                     }
                 }
             }
