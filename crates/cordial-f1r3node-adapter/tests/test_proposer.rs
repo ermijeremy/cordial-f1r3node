@@ -279,6 +279,46 @@ fn proposer_packages_post_state_hash_from_execution() {
 }
 
 #[test]
+fn proposer_excludes_deploys_expired_at_proposal_time() {
+    let mut deploy_pool = DeployPool::new(DeployPoolConfig::default());
+    let mut expired = make_deploy(7);
+    expired.deploy.expiration_timestamp = Some(1_500);
+    deploy_pool.add(expired).expect("add expired deploy");
+
+    let mut live = make_deploy(8);
+    live.deploy.expiration_timestamp = Some(2_500);
+    let live_signature = live.signature.clone();
+    deploy_pool.add(live).expect("add live deploy");
+
+    let captured = Arc::new(Mutex::new(None));
+    let sk = test_signing_key(12);
+    let mut proposer = CordialProposer::new(
+        DisseminationTipSelector,
+        CapturingExecution {
+            captured: Arc::clone(&captured),
+        },
+        Secp256k1BlockSigner::new(sk.clone()),
+        RecordingBroadcaster::new(),
+        NodeId(test_public_key(&sk)),
+        bonds(&[(1, 100)]),
+        DeployPoolConfig::default(),
+    )
+    .with_close_block(false);
+
+    proposer
+        .propose_at_time(&Blocklace::new(), &deploy_pool, 2_000)
+        .expect("proposal should execute only the live deploy");
+
+    let request = captured
+        .lock()
+        .expect("capture lock")
+        .clone()
+        .expect("request captured");
+    assert_eq!(request.deploys.len(), 1);
+    assert_eq!(request.deploys[0].signature, live_signature);
+}
+
+#[test]
 fn proposed_block_passes_f1r3fly_crypto_verifier() {
     let bond_map = bonds(&[(1, 100), (2, 100)]);
 

@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cordial_miners_core::Block;
 use cordial_miners_core::blocklace::Blocklace;
@@ -24,6 +25,7 @@ pub enum ProposeError {
     Broadcast(String),
     PayloadDecode(String),
     SlashFormat(String),
+    Clock(String),
 }
 
 impl std::fmt::Display for ProposeError {
@@ -35,6 +37,7 @@ impl std::fmt::Display for ProposeError {
             Self::Broadcast(msg) => write!(f, "broadcast failed: {msg}"),
             Self::PayloadDecode(msg) => write!(f, "payload decode failed: {msg}"),
             Self::SlashFormat(msg) => write!(f, "slash deploy formatting failed: {msg}"),
+            Self::Clock(msg) => write!(f, "failed to read proposal time: {msg}"),
         }
     }
 }
@@ -469,6 +472,28 @@ where
         blocklace: &Blocklace,
         deploy_pool: &DeployPool,
     ) -> Result<Block, ProposeError> {
+        let current_time_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| ProposeError::Clock(err.to_string()))?
+            .as_millis()
+            .try_into()
+            .map_err(|_| {
+                ProposeError::Clock("Unix time does not fit in u64 milliseconds".into())
+            })?;
+
+        self.propose_at_time(blocklace, deploy_pool, current_time_millis)
+    }
+
+    /// Propose using an explicit Unix timestamp in milliseconds.
+    ///
+    /// Production callers should use [`Self::propose`]. This entry point keeps
+    /// expiration filtering deterministic in tests and replayable runtimes.
+    pub fn propose_at_time(
+        &mut self,
+        blocklace: &Blocklace,
+        deploy_pool: &DeployPool,
+        current_time_millis: u64,
+    ) -> Result<Block, ProposeError> {
         let predecessors = self.tip_selector.select_tips(blocklace, &self.bonds);
 
         let (pre_state_hash, block_number, bonds) = if predecessors.is_empty() {
@@ -494,7 +519,8 @@ where
             self.deploy_pool_config.deploy_lifespan,
         );
 
-        let selected = deploy_pool.select_for_block(block_number, 0, &deploys_in_scope);
+        let selected =
+            deploy_pool.select_for_block(block_number, current_time_millis, &deploys_in_scope);
 
         let request = ExecutionRequest {
             pre_state_hash: pre_state_hash.clone(),
