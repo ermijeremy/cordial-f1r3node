@@ -215,7 +215,10 @@ fn proposer_selects_live_tips_from_blocklace() {
         .propose(&blocklace, &DeployPool::new(DeployPoolConfig::default()))
         .expect("propose should succeed");
 
-    let expected_tips = select_predecessors(&blocklace, &bond_map);
+    let expected_tips: HashSet<_> = select_predecessors(&blocklace, &bond_map)
+        .into_iter()
+        .map(|identity| identity.consensus_identity())
+        .collect();
     assert_eq!(block.content.predecessors, expected_tips);
     assert_eq!(expected_tips.len(), 3, "one tip per honest validator");
 }
@@ -364,6 +367,45 @@ fn proposed_block_passes_f1r3fly_crypto_verifier() {
     blocklace
         .insert(block.clone(), &adapter)
         .expect("blocklace must accept verified block");
+}
+
+#[test]
+fn proposed_child_resolves_on_peers_with_different_parent_signature_proofs() {
+    let parent = make_block(node(1), simple_payload(0, 0x21), HashSet::new());
+    let mut alternate_parent = parent.clone();
+    alternate_parent.identity.signature = vec![0xCD; 72];
+
+    let mut first_peer = Blocklace::new();
+    let mut second_peer = Blocklace::new();
+    insert(&mut first_peer, parent.clone());
+    insert(&mut second_peer, alternate_parent);
+
+    let sk = test_signing_key(43);
+    let mut proposer = build_proposer(
+        NodeId(test_public_key(&sk)),
+        bonds(&[(1, 100)]),
+        MockRuntime::permissive(),
+        Secp256k1BlockSigner::new(sk),
+        RecordingBroadcaster::new(),
+        false,
+    );
+
+    let child = proposer
+        .propose(&first_peer, &DeployPool::new(DeployPoolConfig::default()))
+        .expect("propose child");
+
+    assert_eq!(
+        child.content.predecessors,
+        HashSet::from([parent.identity.consensus_identity()])
+    );
+    first_peer
+        .insert(child.clone(), &MockVerifier)
+        .expect("proposer peer should admit its child");
+    second_peer
+        .insert(child, &MockVerifier)
+        .expect("peer with alternate parent proof should resolve and admit child");
+    assert!(first_peer.is_closed());
+    assert!(second_peer.is_closed());
 }
 
 #[test]

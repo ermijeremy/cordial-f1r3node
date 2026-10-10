@@ -547,9 +547,17 @@ where
             system_deploys: result.system_deploys,
         };
 
+        // Predecessor signatures authenticate the referenced blocks, but are
+        // not part of their stable consensus names. Embedding the local proof
+        // would make this child unresolvable on a peer that retained a
+        // different valid proof for the same (content_hash, creator) pair.
+        let content_predecessors = predecessors
+            .iter()
+            .map(BlockIdentity::consensus_identity)
+            .collect();
         let content = BlockContent {
             payload: payload.to_bytes(),
-            predecessors: predecessors.clone(),
+            predecessors: content_predecessors,
         };
 
         let identity = self
