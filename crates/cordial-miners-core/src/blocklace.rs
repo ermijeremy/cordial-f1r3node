@@ -203,10 +203,7 @@ impl Blocklace {
     /// admitting more than one signature variant would make resolution depend
     /// on message arrival order. Enforce uniqueness whether or not an unsigned
     /// reference has already been admitted.
-    pub(crate) fn conflicting_identity_variant(
-        &self,
-        id: &BlockIdentity,
-    ) -> Option<&BlockIdentity> {
+    pub fn conflicting_identity_variant(&self, id: &BlockIdentity) -> Option<&BlockIdentity> {
         // Replacing an exact identity does not create a collision.
         if self.blocks.contains_key(id) {
             return None;

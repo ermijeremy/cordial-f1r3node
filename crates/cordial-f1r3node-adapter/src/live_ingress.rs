@@ -214,15 +214,27 @@ where
         &self.pending
     }
 
-    pub fn ingest(&mut self, block: Block) -> Result<MirrorUpdate, String> {
-        if self.blocklace.get(&block.identity).is_some() {
-            return Ok(MirrorUpdate {
-                disposition: MirrorDisposition::Duplicate,
-                released_from_buffer: 0,
-            });
+    fn duplicate_or_identity_conflict(&self, id: &BlockIdentity) -> Result<bool, String> {
+        if self.blocklace.get(id).is_some() || self.pending.contains_key(id) {
+            return Ok(true);
         }
 
-        if self.pending.contains_key(&block.identity) {
+        let conflicting = self.blocklace.conflicting_identity_variant(id).or_else(|| {
+            self.pending
+                .keys()
+                .find(|candidate| candidate.same_consensus_identity(id))
+        });
+        if let Some(conflicting) = conflicting {
+            return Err(format!(
+                "Identity conflict: content hash and creator already belong to {conflicting:?}"
+            ));
+        }
+
+        Ok(false)
+    }
+
+    pub fn ingest(&mut self, block: Block) -> Result<MirrorUpdate, String> {
+        if self.duplicate_or_identity_conflict(&block.identity)? {
             return Ok(MirrorUpdate {
                 disposition: MirrorDisposition::Duplicate,
                 released_from_buffer: 0,
@@ -247,14 +259,7 @@ where
     }
 
     pub fn ingest_with_trusted_boundary(&mut self, block: Block) -> Result<MirrorUpdate, String> {
-        if self.blocklace.get(&block.identity).is_some() {
-            return Ok(MirrorUpdate {
-                disposition: MirrorDisposition::Duplicate,
-                released_from_buffer: 0,
-            });
-        }
-
-        if self.pending.contains_key(&block.identity) {
+        if self.duplicate_or_identity_conflict(&block.identity)? {
             return Ok(MirrorUpdate {
                 disposition: MirrorDisposition::Duplicate,
                 released_from_buffer: 0,

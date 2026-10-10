@@ -328,6 +328,14 @@ fn bonds_map_to_vec(bonds: &HashMap<NodeId, u64>) -> Vec<Bond> {
     out
 }
 
+fn active_bonds_to_map(bonds: &[Bond]) -> HashMap<NodeId, u64> {
+    bonds
+        .iter()
+        .filter(|bond| bond.stake > 0)
+        .map(|bond| (bond.validator.clone(), bond.stake))
+        .collect()
+}
+
 fn compare_identity(a: &BlockIdentity, b: &BlockIdentity) -> std::cmp::Ordering {
     a.content_hash
         .cmp(&b.content_hash)
@@ -456,6 +464,11 @@ impl<TS, EE, BS, BC, ES, SF> CordialProposer<TS, EE, BS, BC, ES, SF> {
         self.include_close_block = include;
         self
     }
+
+    /// Bond table used for tip selection by the next proposal.
+    pub fn bonds(&self) -> &HashMap<NodeId, u64> {
+        &self.bonds
+    }
 }
 
 impl<TS, EE, BS, BC, ES, SF> CordialProposer<TS, EE, BS, BC, ES, SF>
@@ -535,6 +548,7 @@ where
             .execute(request)
             .map_err(ProposeError::Execution)?;
 
+        let next_bonds = active_bonds_to_map(&result.new_bonds);
         let payload = CordialBlockPayload {
             state: BlockState {
                 pre_state_hash,
@@ -570,6 +584,11 @@ where
         self.broadcaster
             .broadcast(&block)
             .map_err(ProposeError::Broadcast)?;
+
+        // Activate the post-state validator set only after the proposal has
+        // completed successfully. Failed execution, signing, or broadcast
+        // must leave the next proposal's consensus view unchanged.
+        self.bonds = next_bonds;
 
         Ok(block)
     }

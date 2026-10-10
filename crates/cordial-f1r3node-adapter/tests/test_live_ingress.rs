@@ -175,6 +175,47 @@ fn live_ingress_buffers_out_of_order_blocks_until_predecessors_arrive() {
 }
 
 #[test]
+fn live_ingress_rejects_identity_collisions_while_blocks_are_pending() {
+    let parent_key = test_signing_key(45);
+    let parent = build_test_block_with_predecessors(
+        NodeId(test_public_key(&parent_key)),
+        HashSet::new(),
+        &parent_key,
+        1,
+        1,
+    );
+    let child_key = test_signing_key(46);
+    let child = build_test_block_with_predecessors(
+        NodeId(test_public_key(&child_key)),
+        HashSet::from([parent.identity.consensus_identity()]),
+        &child_key,
+        2,
+        2,
+    );
+    let mut alternate_child = child.clone();
+    alternate_child.identity.signature.push(0xff);
+
+    let mut ingress = LiveIngress::new(RecordingAdapter::default());
+    let update = ingress
+        .ingest_trusted_block(child.clone())
+        .expect("first child variant should be buffered");
+    assert_eq!(update.disposition, MirrorDisposition::Buffered);
+
+    let error = ingress
+        .ingest_trusted_block(alternate_child)
+        .expect_err("second pending identity variant must be rejected");
+    assert!(error.to_string().contains("Identity conflict"));
+    assert_eq!(ingress.pending_blocks().len(), 1);
+    assert!(ingress.pending_blocks().contains_key(&child.identity));
+
+    ingress
+        .ingest_trusted_block(parent)
+        .expect("parent should release the single canonical pending child");
+    assert!(ingress.pending_blocks().is_empty());
+    assert!(ingress.blocklace().get(&child.identity).is_some());
+}
+
+#[test]
 fn live_ingress_window_boundary_applies_blocks_with_missing_predecessors() {
     let signing_key = test_signing_key(14);
     let creator = test_public_key(&signing_key);
