@@ -197,18 +197,11 @@ impl MultiParentCasper for CordialMultiParentCasperFull {
 
 ## Task 9 — Time-based deploy expiration
 
-**Status:** `Option<expiration_timestamp>` is missing from our `Deploy` type.
+**Status:** ✅ **COMPLETED** — the core deploy retains the signed expiration timestamp, adapters preserve it in both directions, and proposal-time selection filters expired deploys using the current Unix time in milliseconds.
 
-**Why it matters.** f1r3node's `DeployData` carries `expiration_timestamp: Option<i64>` — deploys can specify a wall-clock-time deadline beyond which they're rejected. Our `Deploy` struct in `crates/blocklace/src/execution/payload.rs` only has `valid_after_block_number` (block-height window). Block-height expiration is the harder guarantee (deterministic across nodes), but timestamp expiration is what users actually request from RPC clients.
+**Why it matters.** f1r3node's `DeployData` carries `expiration_timestamp: Option<i64>` — deploys can specify a wall-clock-time deadline beyond which they're rejected. Preserving that field is also required for signature verification because it is part of the signed deploy data.
 
-**What to build.**
-
-1. Add `pub expiration_timestamp: Option<u64>` to `blocklace::execution::Deploy`.
-2. Update `DeployPool::is_block_expired` (or add a sibling `is_time_expired`) to check it.
-3. Wire `current_time_millis` through `select_for_block` and `prune_expired` (already accepted as a parameter, currently unused).
-4. Update tests in `test_deploy_pool.rs` to cover timestamp expiration.
-
-**Difficulty:** Small. The pool already accepts `current_time_millis` parameters that go nowhere — the plumbing exists, only the field and the comparison are missing.
+**Implementation.** `Deploy.expiration_timestamp` is preserved through block and RSpace translation because it is part of the signed host data. `DeployPool` applies the host-compatible rule that a deploy is expired only when the current time is greater than its expiration timestamp. `CordialProposer::propose` supplies wall-clock milliseconds, while `propose_at_time` keeps tests deterministic.
 
 ---
 
