@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::block::Block;
 use crate::blocklace::Blocklace;
-use crate::types::BlockIdentity;
+use crate::types::{BlockContent, BlockIdentity};
 
 /// Compute the depth (round number) of a single block.
 ///
@@ -30,12 +30,35 @@ pub fn depth(blocklace: &Blocklace, block_id: &BlockIdentity) -> Option<u64> {
     depth_recursive(blocklace, block_id, &mut HashMap::new())
 }
 
+/// Compute the depth a not-yet-inserted block would have in `blocklace`.
+/// Returns `None` when any predecessor is unavailable, because in that case
+/// the round is not derivable from the local DAG and must be represented as
+/// `null` in the canonical trace.
+pub fn candidate_depth(blocklace: &Blocklace, content: &BlockContent) -> Option<u64> {
+    if content.predecessors.is_empty() {
+        return Some(0);
+    }
+
+    content
+        .predecessors
+        .iter()
+        .map(|predecessor| depth(blocklace, predecessor))
+        .collect::<Option<Vec<_>>>()
+        .and_then(|depths| depths.into_iter().max())
+        .and_then(|maximum| maximum.checked_add(1))
+}
+
 /// Memoized recursive depth computation.
 fn depth_recursive(
     blocklace: &Blocklace,
     block_id: &BlockIdentity,
     cache: &mut HashMap<BlockIdentity, u64>,
 ) -> Option<u64> {
+    // Transport-level predecessor references may omit the signature. Always
+    // cache under the canonical stored identity so one block cannot appear in
+    // the round index twice (once signed and once unsigned).
+    let block_id = blocklace.resolve_identity(block_id)?;
+
     if let Some(&d) = cache.get(block_id) {
         return Some(d);
     }

@@ -1,6 +1,5 @@
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::Hash;
 
 use crate::block::Block;
 use crate::blocklace::Blocklace;
@@ -12,6 +11,9 @@ use crate::consensus::finality::{
 };
 use crate::consensus::round::depth;
 use crate::consensus::wave::wave_of_round;
+use crate::consensus::weight_snapshot::WeightSnapshot;
+#[cfg(feature = "trace")]
+use crate::trace::{self, EmitOutputEvent, TauOrderEvent, TraceEvent};
 use crate::types::{BlockIdentity, NodeId};
 
 #[derive(Debug, Clone, Default)]
@@ -48,7 +50,10 @@ struct PreviousLeaderCacheKey {
 struct WeightedPreviousLeaderCacheKey {
     current_leader: BlockIdentity,
     wavelength: u64,
-    bonds_fingerprint: u64,
+    /// The snapshot, not just its id: the id is a 64-bit hash, so `Eq` must
+    /// compare the real table or a collision returns another table's
+    /// ordering. Cloning is a pointer bump.
+    weight_snapshot: WeightSnapshot,
     leader_selection_id: u64,
 }
 
@@ -65,7 +70,8 @@ struct TauOutputCacheKey {
 struct WeightedTauOutputCacheKey {
     latest_leader: BlockIdentity,
     wavelength: u64,
-    bonds_fingerprint: u64,
+    /// See [`WeightedPreviousLeaderCacheKey::weight_snapshot`].
+    weight_snapshot: WeightSnapshot,
     leader_selection_id: u64,
 }
 
@@ -91,6 +97,9 @@ where
 {
     wavelength: u64,
     bonds: &'a HashMap<NodeId, u64>,
+    /// Captured once per run; rebuilding it per cache lookup would copy the
+    /// whole bond table each time.
+    weights: &'a WeightSnapshot,
     leader_selection_id: u64,
     leader_selection: F,
 }
@@ -118,13 +127,24 @@ pub fn approved_blocks_for_leader(blocklace: &Blocklace, leader: &BlockIdentity)
 ///
 /// The order respects predecessor edges within the supplied block set. When
 /// multiple blocks are ready at the same time, ties are broken by the natural
-/// ordering of `BlockIdentity`, yielding a stable result across nodes.
+/// ordering of their signature-independent consensus identities, yielding a
+/// stable result even if nodes retained different valid signature proofs. The
+/// returned identities are also projected to that consensus form, so raw core
+/// ordering output does not expose whichever proof happened to arrive first.
 ///
 /// Returns [`OrderingError::CycleDetected`] if the supplied subset contains a
 /// cycle, instead of silently returning a partial order.
 pub fn xsort(blocks: &HashSet<Block>) -> Result<Vec<BlockIdentity>, OrderingError> {
     let block_ids: HashSet<BlockIdentity> =
         blocks.iter().map(|block| block.identity.clone()).collect();
+    let mut unsigned_identity_index: HashMap<([u8; 32], NodeId), Option<BlockIdentity>> =
+        HashMap::new();
+    for id in &block_ids {
+        unsigned_identity_index
+            .entry((id.content_hash, id.creator.clone()))
+            .and_modify(|resolved| *resolved = None)
+            .or_insert_with(|| Some(id.clone()));
+    }
     let mut dependents: HashMap<BlockIdentity, Vec<BlockIdentity>> = HashMap::new();
     let mut indegree: HashMap<BlockIdentity, usize> = HashMap::new();
 
@@ -132,34 +152,48 @@ pub fn xsort(blocks: &HashSet<Block>) -> Result<Vec<BlockIdentity>, OrderingErro
         let id = block.identity.clone();
         indegree.entry(id.clone()).or_insert(0);
 
-        for predecessor in &block.content.predecessors {
-            if !block_ids.contains(predecessor) {
+        for predecessor_reference in &block.content.predecessors {
+            let predecessor = if block_ids.contains(predecessor_reference) {
+                predecessor_reference.clone()
+            } else if predecessor_reference.signature.is_empty() {
+                let key = (
+                    predecessor_reference.content_hash,
+                    predecessor_reference.creator.clone(),
+                );
+                let Some(Some(resolved)) = unsigned_identity_index.get(&key) else {
+                    continue;
+                };
+                resolved.clone()
+            } else {
                 continue;
-            }
+            };
 
-            dependents
-                .entry(predecessor.clone())
-                .or_default()
-                .push(id.clone());
+            dependents.entry(predecessor).or_default().push(id.clone());
             *indegree.entry(id.clone()).or_insert(0) += 1;
         }
     }
 
-    let mut ready: BTreeSet<BlockIdentity> = indegree
+    let mut ready: BTreeMap<BlockIdentity, BlockIdentity> = indegree
         .iter()
-        .filter_map(|(id, degree)| if *degree == 0 { Some(id.clone()) } else { None })
+        .filter_map(|(id, degree)| {
+            if *degree == 0 {
+                Some((id.consensus_identity(), id.clone()))
+            } else {
+                None
+            }
+        })
         .collect();
     let mut ordered = Vec::with_capacity(blocks.len());
 
-    while let Some(next) = ready.pop_first() {
-        ordered.push(next.clone());
+    while let Some((_, next)) = ready.pop_first() {
+        ordered.push(next.consensus_identity());
 
         if let Some(children) = dependents.get(&next) {
             for child in children {
                 if let Some(degree) = indegree.get_mut(child) {
                     *degree -= 1;
                     if *degree == 0 {
-                        ready.insert(child.clone());
+                        ready.insert(child.consensus_identity(), child.clone());
                     }
                 }
             }
@@ -205,18 +239,6 @@ fn sync_cache_generation(blocklace: &Blocklace, cache: &mut OrderingCache) {
         cache.tau_output_by_latest_leader.clear();
         cache.weighted_tau_output_by_latest_leader.clear();
     }
-}
-
-fn bonds_fingerprint(bonds: &HashMap<NodeId, u64>) -> u64 {
-    let mut entries: Vec<_> = bonds.iter().collect();
-    entries.sort_by_key(|(left, _)| *left);
-
-    let mut hasher = DefaultHasher::new();
-    for (node, weight) in entries {
-        node.hash(&mut hasher);
-        weight.hash(&mut hasher);
-    }
-    hasher.finish()
 }
 
 fn approved_blocks_for_leader_cached(
@@ -305,7 +327,7 @@ where
     let key = WeightedPreviousLeaderCacheKey {
         current_leader: current_leader.clone(),
         wavelength: config.wavelength,
-        bonds_fingerprint: bonds_fingerprint(config.bonds),
+        weight_snapshot: config.weights.clone(),
         leader_selection_id: config.leader_selection_id,
     };
 
@@ -443,6 +465,42 @@ where
         ordered: Vec::new(),
     };
     tau_from_leader(blocklace, &latest_leader, &config, &mut state)?;
+
+    #[cfg(feature = "trace")]
+    {
+        let wave = depth(blocklace, &latest_leader)
+            .and_then(|r| wave_of_round(r, wavelength))
+            .unwrap_or(0);
+
+        trace::emit(TraceEvent::RunTauOrder(TauOrderEvent {
+            node_id: trace::hex(&latest_leader.creator.0),
+            wave,
+            wavelength,
+            latest_leader_hash: trace::hex(&latest_leader.content_hash),
+            ordered_block_hashes: state
+                .ordered
+                .iter()
+                .map(|id| trace::hex(&id.content_hash))
+                .collect(),
+            output_len: state.ordered.len(),
+        }));
+
+        // Emit one EmitOutput per block, with a Lean-recomputable prefix hash.
+        let mut prefix_hashes: Vec<String> = Vec::new();
+        for (idx, id) in state.ordered.iter().enumerate() {
+            prefix_hashes.push(trace::hex(&id.content_hash));
+            let prefix_hash = trace::output_prefix_hash(&prefix_hashes);
+
+            trace::emit(TraceEvent::EmitOutput(EmitOutputEvent {
+                node_id: trace::hex(&id.creator.0),
+                wave,
+                block_hash: trace::hex(&id.content_hash),
+                output_index: idx,
+                output_prefix_hash: prefix_hash,
+            }));
+        }
+    }
+
     Ok(state.ordered)
 }
 
@@ -524,9 +582,11 @@ where
         return Ok(Vec::new());
     };
 
+    let weights = WeightSnapshot::from_bonds(bonds);
     let config = WeightedTauConfig {
         wavelength,
         bonds,
+        weights: &weights,
         leader_selection_id: 0,
         leader_selection,
     };
@@ -535,6 +595,35 @@ where
         ordered: Vec::new(),
     };
     weighted_tau_from_leader(blocklace, &latest_leader, &config, &mut state)?;
+
+    #[cfg(feature = "trace")]
+    {
+        let wave = depth(blocklace, &latest_leader)
+            .and_then(|round| wave_of_round(round, wavelength))
+            .unwrap_or(0);
+        let ordered_block_hashes: Vec<String> = state
+            .ordered
+            .iter()
+            .map(|id| trace::hex(&id.content_hash))
+            .collect();
+        trace::emit(TraceEvent::RunTauOrder(TauOrderEvent {
+            node_id: trace::hex(&latest_leader.creator.0),
+            wave,
+            wavelength,
+            latest_leader_hash: trace::hex(&latest_leader.content_hash),
+            ordered_block_hashes: ordered_block_hashes.clone(),
+            output_len: state.ordered.len(),
+        }));
+        for (idx, id) in state.ordered.iter().enumerate() {
+            trace::emit(TraceEvent::EmitOutput(EmitOutputEvent {
+                node_id: trace::hex(&id.creator.0),
+                wave,
+                block_hash: trace::hex(&id.content_hash),
+                output_index: idx,
+                output_prefix_hash: trace::output_prefix_hash(&ordered_block_hashes[..=idx]),
+            }));
+        }
+    }
     Ok(state.ordered)
 }
 
@@ -562,10 +651,11 @@ where
         return Ok(Vec::new());
     };
 
+    let weights = WeightSnapshot::from_bonds(bonds);
     let key = WeightedTauOutputCacheKey {
         latest_leader: latest_leader.clone(),
         wavelength,
-        bonds_fingerprint: bonds_fingerprint(bonds),
+        weight_snapshot: weights.clone(),
         leader_selection_id,
     };
     if let Some(ordered) = cache.weighted_tau_output_by_latest_leader.get(&key) {
@@ -575,6 +665,7 @@ where
     let config = WeightedTauConfig {
         wavelength,
         bonds,
+        weights: &weights,
         leader_selection_id,
         leader_selection,
     };
@@ -626,7 +717,7 @@ where
 
     let newly_approved: HashSet<Block> = approved_blocks_for_leader(blocklace, leader)
         .into_iter()
-        .filter(|block| !state.emitted.contains(&block.identity))
+        .filter(|block| !state.emitted.contains(&block.identity.consensus_identity()))
         .collect();
 
     for id in xsort(&newly_approved)? {
@@ -694,7 +785,7 @@ where
 
     let newly_approved: HashSet<Block> = approved_blocks_for_leader(blocklace, leader)
         .into_iter()
-        .filter(|block| !state.emitted.contains(&block.identity))
+        .filter(|block| !state.emitted.contains(&block.identity.consensus_identity()))
         .collect();
 
     for id in xsort(&newly_approved)? {
@@ -746,8 +837,9 @@ fn emit_checkpoint_prefix(
     }
 
     for id in blocklace.checkpoint_order_prefix() {
+        let id = id.consensus_identity();
         if state.emitted.insert(id.clone()) {
-            state.ordered.push(id.clone());
+            state.ordered.push(id);
         }
     }
 
@@ -766,8 +858,9 @@ fn emit_weighted_checkpoint_prefix(
     }
 
     for id in blocklace.checkpoint_weighted_order_prefix() {
+        let id = id.consensus_identity();
         if state.emitted.insert(id.clone()) {
-            state.ordered.push(id.clone());
+            state.ordered.push(id);
         }
     }
 
@@ -784,4 +877,115 @@ fn checkpoint_predecessor<'a>(
     }
 
     Some(checkpoint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(id: u8) -> NodeId {
+        NodeId(vec![id])
+    }
+
+    fn block(seed: u8) -> BlockIdentity {
+        let mut content_hash = [0u8; 32];
+        content_hash[0] = seed;
+        BlockIdentity {
+            content_hash,
+            creator: node(seed),
+            signature: vec![],
+        }
+    }
+
+    fn table(entries: &[(u8, u64)]) -> HashMap<NodeId, u64> {
+        entries
+            .iter()
+            .map(|(id, weight)| (node(*id), *weight))
+            .collect()
+    }
+
+    /// Two different weight tables forced to share a fingerprint, since a
+    /// real collision is impractical to find by search.
+    fn colliding_pair() -> (WeightSnapshot, WeightSnapshot) {
+        // Same total, different distribution: these can finalize different
+        // leaders and so order differently.
+        let even = WeightSnapshot::from_bonds(&table(&[(1, 100), (2, 100), (3, 100)]));
+        let skewed = WeightSnapshot::from_bonds_with_id(
+            &table(&[(1, 150), (2, 75), (3, 75)]),
+            even.id().clone(),
+        );
+
+        assert_eq!(even.id(), skewed.id(), "collision was not forced");
+        assert_ne!(even, skewed, "the two tables must still differ");
+        (even, skewed)
+    }
+
+    #[test]
+    fn colliding_snapshots_keep_separate_weighted_tau_entries() {
+        let (even, skewed) = colliding_pair();
+
+        let key_even = WeightedTauOutputCacheKey {
+            latest_leader: block(1),
+            wavelength: 3,
+            weight_snapshot: even,
+            leader_selection_id: 0,
+        };
+        let key_skewed = WeightedTauOutputCacheKey {
+            weight_snapshot: skewed,
+            ..key_even.clone()
+        };
+
+        assert_ne!(
+            key_even, key_skewed,
+            "equal ids must not make the keys equal"
+        );
+
+        let mut cache: HashMap<
+            WeightedTauOutputCacheKey,
+            Result<Vec<BlockIdentity>, OrderingError>,
+        > = HashMap::new();
+
+        cache.insert(key_even.clone(), Ok(vec![block(1)]));
+        assert!(
+            !cache.contains_key(&key_skewed),
+            "the skewed table must not read the even table's ordering"
+        );
+
+        cache.insert(key_skewed.clone(), Ok(vec![block(2)]));
+        assert_eq!(cache.get(&key_even), Some(&Ok(vec![block(1)])));
+        assert_eq!(cache.get(&key_skewed), Some(&Ok(vec![block(2)])));
+        assert_eq!(cache.len(), 2, "both entries must coexist");
+    }
+
+    #[test]
+    fn colliding_snapshots_keep_separate_previous_leader_entries() {
+        let (even, skewed) = colliding_pair();
+
+        let key_even = WeightedPreviousLeaderCacheKey {
+            current_leader: block(1),
+            wavelength: 3,
+            weight_snapshot: even,
+            leader_selection_id: 0,
+        };
+        let key_skewed = WeightedPreviousLeaderCacheKey {
+            weight_snapshot: skewed,
+            ..key_even.clone()
+        };
+
+        assert_ne!(key_even, key_skewed);
+
+        let mut cache: HashMap<WeightedPreviousLeaderCacheKey, Option<BlockIdentity>> =
+            HashMap::new();
+
+        cache.insert(key_even.clone(), Some(block(1)));
+        assert!(
+            !cache.contains_key(&key_skewed),
+            "the skewed table must not read the even table's previous leader"
+        );
+
+        cache.insert(key_skewed.clone(), Some(block(2)));
+        assert_eq!(cache.get(&key_even), Some(&Some(block(1))));
+        assert_eq!(cache.get(&key_skewed), Some(&Some(block(2))));
+        assert_eq!(cache.len(), 2);
+    }
 }

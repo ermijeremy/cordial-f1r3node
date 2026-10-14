@@ -13,11 +13,13 @@ use cordial_f1r3node_adapter::block_translation::{block_to_message, message_to_b
 use cordial_miners_core::Block;
 use cordial_miners_core::crypto::hash_content;
 use cordial_miners_core::execution::{
-    BlockState, Bond as CmBond, CordialBlockPayload, Deploy as CmDeploy,
+    BlockState, Bond as CmBond, CordialBlockPayload, Deploy as CmDeploy, DeploySignatureAlgorithm,
     ProcessedDeploy as CmProcessed, ProcessedSystemDeploy as CmSystem,
     SignedDeploy as CmSignedDeploy,
 };
 use cordial_miners_core::types::{BlockContent, BlockIdentity, NodeId};
+
+use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
@@ -38,9 +40,11 @@ fn build_test_block(num_deploys: usize) -> Block {
                     phlo_limit: 10_000,
                     valid_after_block_number: 0,
                     shard_id: "root".to_string(),
+                    expiration_timestamp: None,
                 },
                 deployer: vec![0xAA; 32],
                 signature: vec![0xBB; 64],
+                signature_algorithm: DeploySignatureAlgorithm::Ed25519,
             },
             cost: 100,
             is_failed: false,
@@ -90,6 +94,7 @@ fn bench_block_to_message(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("block_translation/block_to_message");
     group.sample_size(20);
+    group.measurement_time(Duration::from_secs(2));
 
     for &n in deploy_counts {
         let block = build_test_block(n);
@@ -110,6 +115,7 @@ fn bench_message_to_block(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("block_translation/message_to_block");
     group.sample_size(20);
+    group.measurement_time(Duration::from_secs(2));
 
     for &n in deploy_counts {
         let block = build_test_block(n);

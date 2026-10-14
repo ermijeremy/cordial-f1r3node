@@ -71,21 +71,13 @@ The split exists so consumers who only want consensus pay nothing for f1r3node i
 
 ## Task 2 — Wire up `compute_bonds` so `new_bonds` reflects post-state
 
-**Status:** Documented as a follow-up; placeholder in code.
+**Status:** ✅ **COMPLETED** — execution now uses `compute_state_with_bonds` and translates the post-state bond set with checked stakes and deterministic ordering.
 
-**Why it matters.** `F1r3RspaceRuntime::execute_block` currently returns the caller's input bonds verbatim in `ExecutionResult.new_bonds`. That's wrong: bonds in f1r3node are *state-hash-addressable*, meaning they live inside the tuplespace and change when system deploys (slash, register validator) execute. After running deploys, the *correct* bonds may differ from the pre-deploy bonds.
+**Why it matters.** Bonds in f1r3node are *state-hash-addressable*: system deploys can change them during execution, so the input bond set is not a valid result for the new state.
 
-**What to build.** In `crates/blocklace-f1r3rspace/src/lib.rs`, after the `compute_state` call returns the post-state hash, call `self.f1r3_rt.compute_bonds(&post_hash).await?` and translate the resulting `Vec<f1r3node::Bond>` into our `Vec<blocklace::execution::Bond>`. Replace the current line:
+**Implementation.** `F1r3RspaceRuntime::execute_block` calls `compute_state_with_bonds`, translates the returned host bonds with checked `i64` to `u64` conversion, and sorts them by validator identity before assigning `ExecutionResult.new_bonds`. Runtime and bond-query failures are propagated.
 
-```rust
-new_bonds: request.bonds.clone(), // unchanged; see module docs
-```
-
-with the translated result.
-
-**Difficulty:** Small. The method exists on `RuntimeManager` (line 729 in `runtime_manager.rs`); only translation glue is needed. There's a `bond_to_blocklace` helper to write — straightforward `validator: NodeId(b.validator.to_vec()), stake: b.stake as u64`.
-
-**Test it.** Once Task 1 lands, extend it: insert a `SystemDeployRequest::Slash` for a known validator and assert that validator no longer appears in `result.new_bonds`.
+**Integration coverage.** The ignored real-RSpace suite includes a successful slash and asserts that the affected validator is absent from `new_bonds` or has zero effective stake. Validator registration is not represented by the current core `SystemDeployRequest` API.
 
 ---
 
@@ -153,17 +145,13 @@ Then update `F1r3RspaceRuntime::system_deploy_to_f1r3node` to pass the real `inv
 
 ---
 
-## Task 6 — Byte-for-byte block hash parity
+## Task 6 — Keep wire and adapter hash domains separate
 
-**Status:** Our `compute_block_hash` is logically equivalent but not byte-identical to f1r3node's `hash_block`.
+**Status:** `GrpcBlockMapper::from_protobuf` calls f1r3node's `casper::rust::util::proto_util::hash_block` on the original message and verifies its wire signature before translation. The `models` and `casper` path dependencies are enabled.
 
-**Why it matters.** f1r3node's `hash_block` (in `casper/src/rust/util/proto_util.rs:391`) computes Blake2b-256 over the *protobuf-encoded* header and body bytes. Ours hashes a deterministic length-prefixed layout of the mirror struct fields. The result is the same conceptually (sender + content + shard all contribute) but the bytes differ. This means a block hash we compute in `blocklace-f1r3node::compute_block_hash` won't match what f1r3node's machinery would compute for the same logical block.
+**Local compatibility path.** `compute_adapter_snapshot_hash` hashes a deterministic, selected-field layout of the adapter mirror. It is not the f1r3node wire hash and does not commit to all message fields. `from_adapter_message` accepts this local snapshot hash or Cordial's internal `hash_content`; signatures on that path cover the internal content hash.
 
-**Where it bites.** Anywhere downstream code expects to compare hashes between our adapter output and a hash f1r3node already computed. For now, no such code path exists in our integration — we always re-derive hashes on each side.
-
-**What to build.** When/if we enable the `models` path dep in `blocklace-f1r3node` (Task 5), `compute_block_hash` can call `header.to_proto().encode_to_vec()` and `body.to_proto().encode_to_vec()` directly, matching f1r3node's layout exactly. Add a test that pins our output to f1r3node's `hash_block` for a known fixture.
-
-**Difficulty:** Small once Task 5 is done; Medium otherwise (mirror prost serialization manually, brittle).
+**Tests.** `test_grpc_ingest.rs` uses `ValidatorIdentity::sign_block` for real f1r3node wire validation, rejects tampered wire fields/signatures and substitution of either local hash, and separately tests local adapter compatibility. Local helper tests do not establish wire interoperability.
 
 ---
 
@@ -209,18 +197,11 @@ impl MultiParentCasper for CordialMultiParentCasperFull {
 
 ## Task 9 — Time-based deploy expiration
 
-**Status:** `Option<expiration_timestamp>` is missing from our `Deploy` type.
+**Status:** ✅ **COMPLETED** — the core deploy retains the signed expiration timestamp, adapters preserve it in both directions, and proposal-time selection filters expired deploys using the current Unix time in milliseconds.
 
-**Why it matters.** f1r3node's `DeployData` carries `expiration_timestamp: Option<i64>` — deploys can specify a wall-clock-time deadline beyond which they're rejected. Our `Deploy` struct in `crates/blocklace/src/execution/payload.rs` only has `valid_after_block_number` (block-height window). Block-height expiration is the harder guarantee (deterministic across nodes), but timestamp expiration is what users actually request from RPC clients.
+**Why it matters.** f1r3node's `DeployData` carries `expiration_timestamp: Option<i64>` — deploys can specify a wall-clock-time deadline beyond which they're rejected. Preserving that field is also required for signature verification because it is part of the signed deploy data.
 
-**What to build.**
-
-1. Add `pub expiration_timestamp: Option<u64>` to `blocklace::execution::Deploy`.
-2. Update `DeployPool::is_block_expired` (or add a sibling `is_time_expired`) to check it.
-3. Wire `current_time_millis` through `select_for_block` and `prune_expired` (already accepted as a parameter, currently unused).
-4. Update tests in `test_deploy_pool.rs` to cover timestamp expiration.
-
-**Difficulty:** Small. The pool already accepts `current_time_millis` parameters that go nowhere — the plumbing exists, only the field and the comparison are missing.
+**Implementation.** `Deploy.expiration_timestamp` is preserved through block and RSpace translation because it is part of the signed host data. `DeployPool` applies the host-compatible rule that a deploy is expired only when the current time is greater than its expiration timestamp. `CordialProposer::propose` supplies wall-clock milliseconds, while `propose_at_time` keeps tests deterministic.
 
 ---
 

@@ -1,5 +1,9 @@
 use crate::block::Block;
+#[cfg(feature = "trace")]
+use crate::consensus::round::{candidate_depth, depth};
 use crate::crypto::CryptoVerifier;
+#[cfg(feature = "trace")]
+use crate::trace::{self, BlockLifecycleEvent, TraceEvent};
 use crate::types::{BlockContent, BlockIdentity, NodeId};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -12,6 +16,12 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 ///  - CHAIN: all blocks from a correct node are totally ordered under  ≺
 pub struct Blocklace {
     pub(crate) blocks: HashMap<BlockIdentity, BlockContent>,
+    /// Missing predecessors accepted explicitly at a bounded-view boundary.
+    ///
+    /// The canonical block content is never rewritten. This side metadata
+    /// records which predecessor identities were outside the imported window
+    /// when a block was admitted.
+    trusted_boundary_predecessors: HashMap<BlockIdentity, HashSet<BlockIdentity>>,
     pub(crate) checkpoint: Option<BlockIdentity>,
     pub(crate) checkpoint_depth: Option<u64>,
     pub(crate) checkpoint_order_prefix: Vec<BlockIdentity>,
@@ -25,6 +35,7 @@ impl Blocklace {
     pub fn new() -> Self {
         Self {
             blocks: HashMap::new(),
+            trusted_boundary_predecessors: HashMap::new(),
             checkpoint: None,
             checkpoint_depth: None,
             checkpoint_order_prefix: Vec::new(),
@@ -55,15 +66,60 @@ impl Blocklace {
     ///
     /// The caller is responsible for having validated the block; this is the
     /// commit step only.
-    pub(crate) fn commit_validated(&mut self, id: BlockIdentity, content: BlockContent) {
+    pub(crate) fn commit_validated(
+        &mut self,
+        id: BlockIdentity,
+        content: BlockContent,
+    ) -> Result<(), BlockIdentity> {
+        if let Some(conflicting) = self.conflicting_identity_variant(&id) {
+            return Err(conflicting.clone());
+        }
+
+        #[cfg(feature = "trace")]
+        let (block_hash, creator, parent_hashes) = (
+            trace::hex(&id.content_hash),
+            trace::hex(&id.creator.0),
+            trace::sorted_block_hashes(&content.predecessors),
+        );
+        #[cfg(feature = "trace")]
+        let inserted_id = id.clone();
+        self.trusted_boundary_predecessors.remove(&id);
         self.blocks.insert(id, content);
+
+        // A newly inserted signed identity may satisfy an unsigned boundary
+        // reference. Clear only references that now resolve uniquely; exact
+        // equality would leave unsigned references behind indefinitely.
+        let blocks = &self.blocks;
+        for boundary in self.trusted_boundary_predecessors.values_mut() {
+            boundary.retain(|pred_id| Self::resolve_identity_in(blocks, pred_id).is_none());
+        }
+        self.trusted_boundary_predecessors
+            .retain(|_, boundary| !boundary.is_empty());
         self.generation += 1;
+        // This low-level commit API has no local-node, wave, or validator-table
+        // context. The block creator is therefore the commit actor; absent
+        // protocol context is represented as JSON null rather than fabricated
+        // defaults.
+        #[cfg(feature = "trace")]
+        trace::emit(TraceEvent::InsertBlock(BlockLifecycleEvent {
+            node_id: creator.clone(),
+            wave: None,
+            round: depth(self, &inserted_id),
+            block_hash,
+            parent_hashes,
+            missing_parent_hashes: vec![],
+            creator,
+            weight_table_hash: None,
+        }));
+
+        Ok(())
     }
 
     /// Remove a block, bumping the generation if anything was removed.
     pub(crate) fn forget_block(&mut self, id: &BlockIdentity) -> bool {
         let removed = self.blocks.remove(id).is_some();
         if removed {
+            self.trusted_boundary_predecessors.remove(id);
             self.generation += 1;
         }
         removed
@@ -95,14 +151,66 @@ impl Default for Blocklace {
 impl Blocklace {
     /// B(b) - get the content of a block by its identity.
     pub fn content(&self, id: &BlockIdentity) -> Option<&BlockContent> {
-        self.blocks.get(id)
+        let resolved = self.resolve_identity(id)?;
+        self.blocks.get(resolved)
     }
 
     /// B[b] - get the full block (identity + content) by identity.
     pub fn get(&self, id: &BlockIdentity) -> Option<Block> {
-        self.blocks.get(id).map(|content| Block {
-            identity: id.clone(),
+        let resolved = self.resolve_identity(id)?;
+        self.blocks.get(resolved).map(|content| Block {
+            identity: resolved.clone(),
             content: content.clone(),
+        })
+    }
+
+    /// Resolve a predecessor reference to a stored block identity.
+    ///
+    /// Some transport formats identify predecessors by content hash and
+    /// creator but do not carry the predecessor signature. An empty-signature
+    /// reference may therefore resolve to a stored full identity only when
+    /// that match is unique. Non-empty signatures always require an exact
+    /// identity match, and ambiguous unsigned references remain unresolved.
+    pub fn resolve_identity(&self, id: &BlockIdentity) -> Option<&BlockIdentity> {
+        Self::resolve_identity_in(&self.blocks, id)
+    }
+
+    fn resolve_identity_in<'a>(
+        blocks: &'a HashMap<BlockIdentity, BlockContent>,
+        id: &BlockIdentity,
+    ) -> Option<&'a BlockIdentity> {
+        if let Some((stored, _)) = blocks.get_key_value(id) {
+            return Some(stored);
+        }
+        if !id.signature.is_empty() {
+            return None;
+        }
+
+        let mut matches = blocks.keys().filter(|candidate| {
+            candidate.content_hash == id.content_hash && candidate.creator == id.creator
+        });
+        let resolved = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(resolved)
+    }
+
+    /// Return an existing identity with the same content hash and creator but
+    /// a different signature.
+    ///
+    /// Unsigned transport references identify predecessors by this pair, so
+    /// admitting more than one signature variant would make resolution depend
+    /// on message arrival order. Enforce uniqueness whether or not an unsigned
+    /// reference has already been admitted.
+    pub fn conflicting_identity_variant(&self, id: &BlockIdentity) -> Option<&BlockIdentity> {
+        // Replacing an exact identity does not create a collision.
+        if self.blocks.contains_key(id) {
+            return None;
+        }
+
+        self.blocks.keys().find(|candidate| {
+            candidate.content_hash == id.content_hash && candidate.creator == id.creator
         })
     }
     /// B[P] - get all blocks whose ids are in the set P>
@@ -140,6 +248,21 @@ impl Blocklace {
     pub(crate) fn is_checkpoint_boundary(&self, id: &BlockIdentity) -> bool {
         self.checkpoint.as_ref() == Some(id)
     }
+
+    /// Missing predecessor identities explicitly trusted for one bounded-view
+    /// block. These identities remain part of the block's canonical content.
+    pub fn trusted_boundary_predecessors(
+        &self,
+        id: &BlockIdentity,
+    ) -> Option<&HashSet<BlockIdentity>> {
+        self.trusted_boundary_predecessors.get(id)
+    }
+
+    /// Whether this blocklace is a bounded partial view rather than a fully
+    /// closed consensus DAG.
+    pub fn has_trusted_boundaries(&self) -> bool {
+        !self.trusted_boundary_predecessors.is_empty()
+    }
 }
 
 // Insertion and Closure axiom
@@ -156,17 +279,88 @@ impl Blocklace {
             .map_err(|e| format!("Invalid signature: {e:?}"))?;
 
         // 2. Closure Axiom Enforcement (Issue 1)
-        for pred_id in &block.content.predecessors {
-            if !self.blocks.contains_key(pred_id) {
-                return Err(format!(
-                    "Closure violation: predecessor {pred_id:?} not in blocklace"
-                ));
+        let missing: Vec<&BlockIdentity> = block
+            .content
+            .predecessors
+            .iter()
+            .filter(|pred_id| self.resolve_identity(pred_id).is_none())
+            .collect();
+
+        if !missing.is_empty() {
+            #[cfg(feature = "trace")]
+            {
+                // A generic Blocklace has no wavelength or bond table, so
+                // wave and weight_table_hash remain explicitly unavailable.
+                let round = candidate_depth(self, &block.content);
+                trace::emit(TraceEvent::BufferBlock(BlockLifecycleEvent {
+                    node_id: trace::hex(&block.identity.creator.0),
+                    wave: None,
+                    round,
+                    block_hash: trace::hex(&block.identity.content_hash),
+                    parent_hashes: trace::sorted_block_hashes(&block.content.predecessors),
+                    missing_parent_hashes: trace::sorted_block_hashes(missing.iter().copied()),
+                    creator: trace::hex(&block.identity.creator.0),
+                    weight_table_hash: None,
+                }));
             }
+            return Err(format!(
+                "Closure violation: predecessor {:?} not in blocklace",
+                missing[0]
+            ));
         }
 
-        // 3. Commit to state
-        self.commit_validated(block.identity.clone(), block.content);
+        // 3. Commit to state. The commit method is the single insertion trace
+        // site shared with `validated_insert`.
+        self.commit_validated(block.identity.clone(), block.content)
+            .map_err(|conflicting| {
+                format!(
+                    "Identity conflict: content hash and creator already belong to {conflicting:?}"
+                )
+            })?;
+
         Ok(())
+    }
+
+    /// Insert a block into a bounded mirror without rewriting signed content.
+    ///
+    /// Missing predecessors are retained in `BlockContent` and recorded as
+    /// explicit boundary metadata. This API is for partial inspection views;
+    /// callers that require a fully closed protocol blocklace must use
+    /// [`Self::insert`].
+    pub fn insert_with_trusted_boundary<V: CryptoVerifier>(
+        &mut self,
+        block: Block,
+        verifier: &V,
+    ) -> Result<HashSet<BlockIdentity>, String> {
+        verifier
+            .verify_block(
+                &block.content,
+                &block.identity.signature,
+                &block.identity.creator,
+            )
+            .map_err(|e| format!("Invalid signature: {e:?}"))?;
+
+        let missing: HashSet<BlockIdentity> = block
+            .content
+            .predecessors
+            .iter()
+            .filter(|pred_id| self.resolve_identity(pred_id).is_none())
+            .cloned()
+            .collect();
+        let id = block.identity.clone();
+
+        self.commit_validated(id.clone(), block.content)
+            .map_err(|conflicting| {
+                format!(
+                    "Identity conflict: content hash and creator already belong to {conflicting:?}"
+                )
+            })?;
+        if !missing.is_empty() {
+            self.trusted_boundary_predecessors
+                .insert(id, missing.clone());
+        }
+
+        Ok(missing)
     }
     // pub fn insert(&mut self, block: Block) -> Result<(), String> {
     //     for pred_id in &block.content.predecessors {
@@ -186,7 +380,7 @@ impl Blocklace {
                 || content
                     .predecessors
                     .iter()
-                    .all(|pred_id| self.blocks.contains_key(pred_id))
+                    .all(|pred_id| self.resolve_identity(pred_id).is_some())
         })
     }
 }
@@ -218,8 +412,10 @@ impl Blocklace {
 
             if let Some(content) = self.content(&current_id) {
                 for pred_id in &content.predecessors {
-                    if self.blocks.contains_key(pred_id) && visited.insert(pred_id.clone()) {
-                        queue.push(pred_id.clone());
+                    if let Some(resolved) = self.resolve_identity(pred_id)
+                        && visited.insert(resolved.clone())
+                    {
+                        queue.push(resolved.clone());
                     }
                 }
             }
@@ -231,9 +427,9 @@ impl Blocklace {
         let mut visited = BTreeSet::new();
         let mut queue = VecDeque::new();
 
-        if !self.blocks.contains_key(from) {
+        let Some(from) = self.resolve_identity(from) else {
             return visited;
-        }
+        };
 
         // Start from the block itself (inclusive closure)
         queue.push_back(from.clone());
@@ -247,8 +443,10 @@ impl Blocklace {
             if let Some(content) = self.content(&current_id) {
                 for pred_id in &content.predecessors {
                     // BTreeSet.insert returns false if the item was already present
-                    if self.blocks.contains_key(pred_id) && visited.insert(pred_id.clone()) {
-                        queue.push_back(pred_id.clone());
+                    if let Some(resolved) = self.resolve_identity(pred_id)
+                        && visited.insert(resolved.clone())
+                    {
+                        queue.push_back(resolved.clone());
                     }
                 }
             }
@@ -275,6 +473,9 @@ impl Blocklace {
 
     /// Check if a < b - a is somewhere in b's ancestry
     pub fn precedes(&self, a: &BlockIdentity, b: &BlockIdentity) -> bool {
+        let Some(a) = self.resolve_identity(a) else {
+            return false;
+        };
         self.ancestors(b.clone())
             .iter()
             .any(|block| &block.identity == a)
@@ -282,7 +483,10 @@ impl Blocklace {
 
     /// Check if a ⪯ b - a  preceeds b or is equal to b
     pub fn preceedes_or_equals(&self, a: &BlockIdentity, b: &BlockIdentity) -> bool {
-        a == b || self.precedes(a, b)
+        match (self.resolve_identity(a), self.resolve_identity(b)) {
+            (Some(a), Some(b)) => a == b || self.precedes(a, b),
+            _ => false,
+        }
     }
 }
 

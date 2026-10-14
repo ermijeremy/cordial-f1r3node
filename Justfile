@@ -53,6 +53,32 @@ ci:
     just test
     just check-core-boundaries
 
+lean-build:
+    cd lean && lake build
+
+lean-check-sorry:
+    cd lean && lake build 2>&1 | tee /tmp/lean-build.log
+    ! grep -q "declaration uses 'sorry'" /tmp/lean-build.log
+
+# Issue #188: generate deterministic Rust traces, then independently replay
+# the positive and deliberately-invalid cases through the Lean CMRef.
+issue188-rust:
+    cargo +{{toolchain}} build -j 2 -p cordial-miners-core
+    cargo +{{toolchain}} test -j 2 -p cordial-miners-core
+    cargo +{{toolchain}} test -j 2 -p cordial-miners-core --features trace
+    cargo +{{toolchain}} test -j 2 -p cordial-miners-core --features trace --test generate_trace_fixtures generate_all_fixtures -- --exact --nocapture --test-threads=1
+
+issue188-lean:
+    cd lean && lake build replay_runner conformance_tests
+    cd lean && lake exe replay_runner
+    cd lean && lake exe conformance_tests
+    just lean-check-sorry
+
+issue188-mutation:
+    bash scripts/issue188_mutation_test.sh
+
+issue188-conformance: issue188-rust issue188-lean issue188-mutation
+
 demo-cordial-env:
     cp -n docker/.env.example {{docker_env}}
 
@@ -129,7 +155,7 @@ demo-cordial-four-node-cluster-config: demo-cordial-env
     docker compose --env-file {{docker_env}} -f {{docker_four_node_cluster}} config >/dev/null
     echo "Cordial Miners real four-node cluster compose file is valid."
 
-demo-cordial-four-node-cluster-up: demo-cordial-env demo-cordial-image-check
+demo-cordial-four-node-cluster-up: demo-cordial-env
     docker compose --env-file {{docker_env}} -f {{docker_four_node_cluster}} up -d
 
 demo-cordial-four-node-cluster-up-legacy: demo-cordial-env
@@ -154,9 +180,15 @@ demo-cordial-four-node-cluster-logs: demo-cordial-env
     docker compose --env-file {{docker_env}} -f {{docker_four_node_cluster}} logs --tail=120 cordial-boot cordial-validator-1 cordial-validator-2 cordial-validator-3 cordial-validator-4
 
 demo-cordial-four-node-cluster-down: demo-cordial-env
-    docker compose --env-file {{docker_env}} -f {{docker_four_node_cluster}} down -v
+    docker compose --env-file {{docker_env}} -f {{docker_four_node_cluster}} down
 
 demo-cordial-four-node-cluster-down-legacy: demo-cordial-env
+    docker-compose --env-file {{docker_env}} -f {{docker_four_node_cluster}} down
+
+demo-cordial-four-node-cluster-reset: demo-cordial-env
+    docker compose --env-file {{docker_env}} -f {{docker_four_node_cluster}} down -v
+
+demo-cordial-four-node-cluster-reset-legacy: demo-cordial-env
     docker-compose --env-file {{docker_env}} -f {{docker_four_node_cluster}} down -v
 
 demo-cordial-down: demo-cordial-env
@@ -164,7 +196,7 @@ demo-cordial-down: demo-cordial-env
     docker compose --env-file {{docker_env}} -f {{docker_prebuilt_standalone}} down -v
     docker compose --env-file {{docker_env}} -f {{docker_conformance}} down -v
     docker compose --env-file {{docker_env}} -f {{docker_four_node}} down -v
-    docker compose --env-file {{docker_env}} -f {{docker_four_node_cluster}} down -v
+    docker compose --env-file {{docker_env}} -f {{docker_four_node_cluster}} down
 
 demo-cordial-local-clean:
     rm -rf {{demo_data}}

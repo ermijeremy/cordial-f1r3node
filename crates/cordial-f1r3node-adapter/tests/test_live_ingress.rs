@@ -4,13 +4,17 @@ use cordial_f1r3node_adapter::block_translation::{
     BlockMessage, Body, F1r3flyState, Header, Justification,
 };
 use cordial_f1r3node_adapter::grpc_ingest::BlocklaceAdapter;
-use cordial_f1r3node_adapter::live_ingress::{LiveIngress, LiveIngressError, LiveIngressPhase};
+use cordial_f1r3node_adapter::live_ingress::{
+    LiveIngress, LiveIngressError, LiveIngressPhase, MirrorDisposition, PorWeightActivationError,
+};
 use cordial_f1r3node_adapter::shard_conf::CasperShardConf;
 use cordial_f1r3node_adapter::shared_ordered_output::ReadOrderedOutput;
 use cordial_miners_core::Block;
+use cordial_miners_core::consensus::is_weighted_supermajority;
 use cordial_miners_core::crypto::{hash_content, sign};
 use cordial_miners_core::execution::{BlockState, CordialBlockPayload};
 use cordial_miners_core::types::{BlockContent, BlockIdentity, NodeId};
+use cordial_por::{PorError, ReputationState};
 
 /// Number of rounds in one consensus wave which same as `ES_WAVELENGTH` in `snapshot.rs`.
 const WAVELENGTH: u64 = 3;
@@ -35,6 +39,56 @@ fn live_ingress_phase_can_progress_without_changing_adapter() {
 }
 
 #[test]
+fn por_weights_replace_values_without_selecting_validators() {
+    let validator_a = NodeId(vec![1]);
+    let validator_b = NodeId(vec![2]);
+    let non_validator = NodeId(vec![3]);
+    let initial_bonds = HashMap::from([(validator_a.clone(), 50), (validator_b.clone(), 50)]);
+    let mut ingress =
+        LiveIngress::with_consensus_view((), initial_bonds, CasperShardConf::default(), "root");
+    let mut state = ReputationState::new(0);
+    state.set_reputation(validator_a.clone(), 20);
+    state.set_reputation(validator_b.clone(), 80);
+    state.set_reputation(non_validator.clone(), 1_000);
+
+    ingress.apply_por_weights(&state).unwrap();
+
+    assert_eq!(ingress.bonds().len(), 2);
+    assert_eq!(ingress.bonds().get(&validator_a), Some(&20));
+    assert_eq!(ingress.bonds().get(&validator_b), Some(&80));
+    assert!(!ingress.bonds().contains_key(&non_validator));
+    assert!(is_weighted_supermajority(
+        &HashSet::from([validator_b]),
+        ingress.bonds(),
+    ));
+}
+
+#[test]
+fn failed_por_weight_projection_leaves_cordial_weights_unchanged() {
+    let validator_a = NodeId(vec![1]);
+    let validator_b = NodeId(vec![2]);
+    let initial_bonds = HashMap::from([(validator_a.clone(), 50), (validator_b.clone(), 50)]);
+    let mut ingress = LiveIngress::with_consensus_view(
+        (),
+        initial_bonds.clone(),
+        CasperShardConf::default(),
+        "root",
+    );
+    let mut incomplete = ReputationState::new(0);
+    incomplete.set_reputation(validator_a, 100);
+
+    let error = ingress.apply_por_weights(&incomplete).unwrap_err();
+
+    assert_eq!(
+        error,
+        PorWeightActivationError::Projection(PorError::MissingAuthorizedValidatorReputation(
+            validator_b
+        ))
+    );
+    assert_eq!(ingress.bonds(), &initial_bonds);
+}
+
+#[test]
 fn live_ingress_routes_valid_block_messages_through_grpc_ingest() {
     let signing_key = test_signing_key(7);
     let creator = test_public_key(&signing_key);
@@ -47,8 +101,8 @@ fn live_ingress_routes_valid_block_messages_through_grpc_ingest() {
 
     assert_eq!(ingress.phase(), LiveIngressPhase::Connected);
     assert_eq!(
-        block.identity.content_hash,
-        <[u8; 32]>::try_from(block_msg.block_hash.as_slice()).expect("valid 32-byte block hash")
+        block.identity.content_hash.to_vec(),
+        message_content_hash(&block_msg)
     );
     assert_eq!(ingress.adapter().callback_count, 1);
     assert_eq!(ingress.adapter().received_blocks.len(), 1);
@@ -91,14 +145,14 @@ fn live_ingress_buffers_out_of_order_blocks_until_predecessors_arrive() {
     let child_creator = test_public_key(&child_signing_key);
     let child = build_test_block_message(
         &child_creator,
-        &[(parent.block_hash.clone(), parent.sender.clone())],
+        &[(message_content_hash(&parent), parent.sender.clone())],
         &child_signing_key,
         "secp256k1",
     );
 
     let mut ingress = LiveIngress::new(RecordingAdapter::default());
 
-    ingress
+    let translated_child = ingress
         .ingest_block_message(&child)
         .expect("child block should be accepted into pending state");
     assert_eq!(ingress.blocklace().dom().len(), 0);
@@ -109,6 +163,56 @@ fn live_ingress_buffers_out_of_order_blocks_until_predecessors_arrive() {
         .expect("parent block should release buffered child");
     assert_eq!(ingress.blocklace().dom().len(), 2);
     assert!(ingress.pending_blocks().is_empty());
+    let mirrored_child = ingress
+        .blocklace()
+        .content(&translated_child.identity)
+        .expect("released child should be stored");
+    assert_eq!(
+        bincode::serialize(mirrored_child).unwrap(),
+        bincode::serialize(&translated_child.content).unwrap(),
+        "pending release must not rewrite serialized block content"
+    );
+}
+
+#[test]
+fn live_ingress_rejects_identity_collisions_while_blocks_are_pending() {
+    let parent_key = test_signing_key(45);
+    let parent = build_test_block_with_predecessors(
+        NodeId(test_public_key(&parent_key)),
+        HashSet::new(),
+        &parent_key,
+        1,
+        1,
+    );
+    let child_key = test_signing_key(46);
+    let child = build_test_block_with_predecessors(
+        NodeId(test_public_key(&child_key)),
+        HashSet::from([parent.identity.consensus_identity()]),
+        &child_key,
+        2,
+        2,
+    );
+    let mut alternate_child = child.clone();
+    alternate_child.identity.signature.push(0xff);
+
+    let mut ingress = LiveIngress::new(RecordingAdapter::default());
+    let update = ingress
+        .ingest_trusted_block(child.clone())
+        .expect("first child variant should be buffered");
+    assert_eq!(update.disposition, MirrorDisposition::Buffered);
+
+    let error = ingress
+        .ingest_trusted_block(alternate_child)
+        .expect_err("second pending identity variant must be rejected");
+    assert!(error.to_string().contains("Identity conflict"));
+    assert_eq!(ingress.pending_blocks().len(), 1);
+    assert!(ingress.pending_blocks().contains_key(&child.identity));
+
+    ingress
+        .ingest_trusted_block(parent)
+        .expect("parent should release the single canonical pending child");
+    assert!(ingress.pending_blocks().is_empty());
+    assert!(ingress.blocklace().get(&child.identity).is_some());
 }
 
 #[test]
@@ -122,7 +226,7 @@ fn live_ingress_window_boundary_applies_blocks_with_missing_predecessors() {
     };
     let block = build_test_block_with_predecessors(
         NodeId(creator),
-        [missing_parent].into_iter().collect(),
+        [missing_parent.clone()].into_iter().collect(),
         &signing_key,
         25,
         8,
@@ -141,13 +245,143 @@ fn live_ingress_window_boundary_applies_blocks_with_missing_predecessors() {
         .expect("window boundary ingestion should apply trusted recent block");
     assert_eq!(window_ingress.blocklace().dom().len(), 1);
     assert!(window_ingress.pending_blocks().is_empty());
-    assert!(
+    let mirrored = window_ingress
+        .blocklace()
+        .content(&block.identity)
+        .expect("window block should be mirrored");
+    assert_eq!(mirrored.payload, block.content.payload);
+    assert_eq!(mirrored.predecessors, block.content.predecessors);
+    let expected_boundary = HashSet::from([missing_parent]);
+    assert_eq!(
         window_ingress
             .blocklace()
-            .content(&block.identity)
-            .expect("window block should be mirrored")
-            .predecessors
-            .is_empty()
+            .trusted_boundary_predecessors(&block.identity),
+        Some(&expected_boundary)
+    );
+    assert!(window_ingress.blocklace().has_trusted_boundaries());
+    assert!(!window_ingress.blocklace().is_closed());
+}
+
+#[test]
+fn live_ingress_does_not_substitute_same_hash_predecessor_identity() {
+    let parent_signing_key = test_signing_key(15);
+    let parent_creator = test_public_key(&parent_signing_key);
+    let parent = build_test_block_with_predecessors(
+        NodeId(parent_creator.clone()),
+        HashSet::new(),
+        &parent_signing_key,
+        1,
+        1,
+    );
+    let mut alternate_parent = parent.identity.clone();
+    alternate_parent.signature.push(0xff);
+
+    let child_signing_key = test_signing_key(16);
+    let child_creator = test_public_key(&child_signing_key);
+    let child = build_test_block_with_predecessors(
+        NodeId(child_creator),
+        [alternate_parent.clone()].into_iter().collect(),
+        &child_signing_key,
+        2,
+        2,
+    );
+
+    let mut ingress = LiveIngress::new(RecordingAdapter::default());
+    ingress.ingest_trusted_block(parent).unwrap();
+    let update = ingress.ingest_trusted_block(child.clone()).unwrap();
+
+    assert_eq!(update.disposition, MirrorDisposition::Buffered);
+    let pending = &ingress
+        .pending_blocks()
+        .get(&child.identity)
+        .expect("child should remain pending")
+        .content;
+    assert_eq!(pending.payload, child.content.payload);
+    assert_eq!(pending.predecessors, child.content.predecessors);
+    assert!(child.content.predecessors.contains(&alternate_parent));
+}
+
+#[test]
+fn trusted_boundary_records_only_missing_predecessors_without_rewriting_content() {
+    let parent_key = test_signing_key(17);
+    let parent = build_test_block_with_predecessors(
+        NodeId(test_public_key(&parent_key)),
+        HashSet::new(),
+        &parent_key,
+        1,
+        1,
+    );
+    let missing = BlockIdentity {
+        content_hash: [0x44; 32],
+        creator: NodeId(vec![0x55]),
+        signature: vec![0x66; 64],
+    };
+    let child_key = test_signing_key(18);
+    let child = build_test_block_with_predecessors(
+        NodeId(test_public_key(&child_key)),
+        HashSet::from([parent.identity.clone(), missing.clone()]),
+        &child_key,
+        2,
+        2,
+    );
+    let original_content = bincode::serialize(&child.content).unwrap();
+
+    let mut ingress = LiveIngress::new(RecordingAdapter::default());
+    ingress.ingest_trusted_block(parent).unwrap();
+    ingress.ingest_trusted_window_block(child.clone()).unwrap();
+
+    let mirrored = ingress.blocklace().content(&child.identity).unwrap();
+    assert_eq!(bincode::serialize(mirrored).unwrap(), original_content);
+    assert_eq!(
+        ingress
+            .blocklace()
+            .trusted_boundary_predecessors(&child.identity),
+        Some(&HashSet::from([missing]))
+    );
+}
+
+#[test]
+fn unsigned_trusted_boundary_clears_when_signed_parent_arrives() {
+    let parent_key = test_signing_key(19);
+    let parent = build_test_block_with_predecessors(
+        NodeId(test_public_key(&parent_key)),
+        HashSet::new(),
+        &parent_key,
+        1,
+        1,
+    );
+    let mut unsigned_parent = parent.identity.clone();
+    unsigned_parent.signature.clear();
+
+    let child_key = test_signing_key(20);
+    let child = build_test_block_with_predecessors(
+        NodeId(test_public_key(&child_key)),
+        HashSet::from([unsigned_parent.clone()]),
+        &child_key,
+        2,
+        2,
+    );
+
+    let mut ingress = LiveIngress::new(RecordingAdapter::default());
+    ingress
+        .ingest_trusted_window_block(child.clone())
+        .expect("bounded child should be admitted");
+    assert_eq!(
+        ingress
+            .blocklace()
+            .trusted_boundary_predecessors(&child.identity),
+        Some(&HashSet::from([unsigned_parent]))
+    );
+
+    ingress
+        .ingest_trusted_block(parent.clone())
+        .expect("signed parent should be admitted");
+
+    assert!(!ingress.blocklace().has_trusted_boundaries());
+    assert!(ingress.blocklace().is_closed());
+    assert_eq!(
+        ingress.blocklace().predecessors(&child.identity),
+        HashSet::from([parent])
     );
 }
 
@@ -202,9 +436,11 @@ fn live_ingress_exposes_snapshot_and_finality_over_mirrored_state() {
     let leader =
         build_test_block_message_with_state(&creator_1, &[], &signing_key_1, "secp256k1", 0, 1);
 
+    let leader_hash = message_content_hash(&leader);
+
     let round1_v2 = build_test_block_message_with_state(
         &creator_2,
-        &[(leader.block_hash.clone(), leader.sender.clone())],
+        &[(leader_hash.clone(), leader.sender.clone())],
         &signing_key_2,
         "secp256k1",
         1,
@@ -212,7 +448,7 @@ fn live_ingress_exposes_snapshot_and_finality_over_mirrored_state() {
     );
     let round1_v3 = build_test_block_message_with_state(
         &creator_3,
-        &[(leader.block_hash.clone(), leader.sender.clone())],
+        &[(leader_hash.clone(), leader.sender.clone())],
         &signing_key_3,
         "secp256k1",
         1,
@@ -220,7 +456,7 @@ fn live_ingress_exposes_snapshot_and_finality_over_mirrored_state() {
     );
     let round1_v4 = build_test_block_message_with_state(
         &creator_4,
-        &[(leader.block_hash.clone(), leader.sender.clone())],
+        &[(leader_hash.clone(), leader.sender.clone())],
         &signing_key_4,
         "secp256k1",
         1,
@@ -228,9 +464,9 @@ fn live_ingress_exposes_snapshot_and_finality_over_mirrored_state() {
     );
 
     let round1_support = [
-        (round1_v2.block_hash.clone(), round1_v2.sender.clone()),
-        (round1_v3.block_hash.clone(), round1_v3.sender.clone()),
-        (round1_v4.block_hash.clone(), round1_v4.sender.clone()),
+        (message_content_hash(&round1_v2), round1_v2.sender.clone()),
+        (message_content_hash(&round1_v3), round1_v3.sender.clone()),
+        (message_content_hash(&round1_v4), round1_v4.sender.clone()),
     ];
 
     let round2_v2 = build_test_block_message_with_state(
@@ -276,18 +512,13 @@ fn live_ingress_exposes_snapshot_and_finality_over_mirrored_state() {
         .ordered_finalized_blocks()
         .expect("weighted tau lookup should succeed");
 
-    assert_eq!(snapshot.last_finalized_block, leader.block_hash);
-    assert_eq!(last_finalized, Some(leader.block_hash.clone()));
-    assert!(snapshot.dag.dag_set.contains(&leader.block_hash));
-    assert!(
-        snapshot
-            .dag
-            .finalized_blocks_set
-            .contains(&leader.block_hash)
-    );
+    assert_eq!(snapshot.last_finalized_block, leader_hash);
+    assert_eq!(last_finalized, Some(leader_hash.clone()));
+    assert!(snapshot.dag.dag_set.contains(&leader_hash));
+    assert!(snapshot.dag.finalized_blocks_set.contains(&leader_hash));
     assert!(!ordered.is_empty());
     assert_eq!(ordered, snapshot.ordered_finalized_blocks);
-    assert!(ordered.contains(&leader.block_hash));
+    assert!(ordered.contains(&leader_hash));
     assert_eq!(snapshot.on_chain_state.shard_conf.shard_name, "root");
     assert_eq!(snapshot.on_chain_state.active_validators.len(), 4);
 }
@@ -330,7 +561,7 @@ fn latest_ordered_output_is_monotonic_across_batches() {
             i,
             (i + 1) as u8,
         );
-        prev_hash = block_msg.block_hash.clone();
+        prev_hash = message_content_hash(&block_msg);
         blocks.push(block_msg);
     }
 
@@ -378,14 +609,14 @@ fn latest_ordered_output_is_monotonic_across_batches() {
         first_output
             .blocks
             .iter()
-            .any(|id| id.content_hash == blocks[0].block_hash.as_slice()),
+            .any(|id| id.content_hash == message_content_hash(&blocks[0]).as_slice()),
         "genesis (wave 0 leader) should be finalized after wave 0"
     );
     assert!(
         second_output
             .blocks
             .iter()
-            .any(|id| id.content_hash == blocks[3].block_hash.as_slice()),
+            .any(|id| id.content_hash == message_content_hash(&blocks[3]).as_slice()),
         "block 3 (wave 1 leader) should be finalized after wave 1"
     );
 }
@@ -423,7 +654,7 @@ fn latest_ordered_output_rejects_same_round_fork() {
     // this is the equivocation scenario.
     let fork_a = build_test_block_message_with_state(
         &creator,
-        &[(genesis.block_hash.clone(), creator.clone())],
+        &[(message_content_hash(&genesis), creator.clone())],
         &signing_key,
         "secp256k1",
         1,
@@ -431,7 +662,7 @@ fn latest_ordered_output_rejects_same_round_fork() {
     );
     let fork_b = build_test_block_message_with_state(
         &creator,
-        &[(genesis.block_hash.clone(), creator.clone())],
+        &[(message_content_hash(&genesis), creator.clone())],
         &signing_key,
         "secp256k1",
         2,
@@ -500,7 +731,7 @@ fn last_finalized_block_hash_and_latest_ordered_output_agree_during_fork() {
     // both built on genesis — this is the equivocation scenario.
     let fork_a = build_test_block_message_with_state(
         &creator,
-        &[(genesis.block_hash.clone(), creator.clone())],
+        &[(message_content_hash(&genesis), creator.clone())],
         &signing_key,
         "secp256k1",
         1,
@@ -508,7 +739,7 @@ fn last_finalized_block_hash_and_latest_ordered_output_agree_during_fork() {
     );
     let fork_b = build_test_block_message_with_state(
         &creator,
-        &[(genesis.block_hash.clone(), creator.clone())],
+        &[(message_content_hash(&genesis), creator.clone())],
         &signing_key,
         "secp256k1",
         2,
@@ -585,7 +816,7 @@ fn latest_ordered_output_before_first_complete_wave() {
 
     let round_two = build_test_block_message_with_state(
         &creator,
-        &[(genesis.block_hash.clone(), creator.clone())],
+        &[(message_content_hash(&genesis), creator.clone())],
         &signing_key,
         "secp256k1",
         1,
@@ -677,6 +908,22 @@ fn build_test_block_message(
     build_test_block_message_with_state(creator, parents, signing_key, sig_algorithm, 0, 1)
 }
 
+/// The internal content hash the mirror stores for a message (the hash
+/// `message_to_block` recomputes). This is distinct from the adapter-local
+/// `block_msg.block_hash` (which `compute_adapter_snapshot_hash` produces) that the
+/// mapper validates on ingest. Children must reference this hash, and
+/// assertions over mirrored state must compare against it, for linkage and
+/// comparison to line up.
+fn message_content_hash(msg: &BlockMessage) -> Vec<u8> {
+    use cordial_f1r3node_adapter::block_translation::message_to_block;
+
+    message_to_block(msg)
+        .expect("test message should translate")
+        .identity
+        .content_hash
+        .to_vec()
+}
+
 fn build_test_block_message_with_state(
     creator: &[u8],
     parents: &[(Vec<u8>, Vec<u8>)],
@@ -685,6 +932,9 @@ fn build_test_block_message_with_state(
     block_number: u64,
     state_tag: u8,
 ) -> BlockMessage {
+    use cordial_f1r3node_adapter::block_translation::message_to_block;
+    use cordial_f1r3node_adapter::crypto_bridge::compute_adapter_snapshot_hash;
+
     let justifications: Vec<Justification> = parents
         .iter()
         .filter(|(hash, _)| hash.len() == 32)
@@ -694,40 +944,10 @@ fn build_test_block_message_with_state(
         })
         .collect();
 
-    let payload = CordialBlockPayload {
-        state: BlockState {
-            pre_state_hash: vec![state_tag; 32],
-            post_state_hash: vec![state_tag.wrapping_add(1); 32],
-            bonds: vec![],
-            block_number,
-        },
-        deploys: vec![],
-        rejected_deploys: vec![],
-        system_deploys: vec![],
-    };
-    let payload_bytes = payload.to_bytes();
-
-    let mut predecessors = HashSet::new();
-    for jus in &justifications {
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&jus.latest_block_hash);
-        predecessors.insert(BlockIdentity {
-            content_hash: hash_array,
-            creator: NodeId(jus.validator.clone()),
-            signature: vec![],
-        });
-    }
-
-    let content = BlockContent {
-        payload: payload_bytes,
-        predecessors,
-    };
-
-    let content_hash = hash_content(&content);
-    let signature = sign(&content_hash, signing_key);
-
-    BlockMessage {
-        block_hash: content_hash.to_vec(),
+    // Build the message with placeholder block_hash and signature first;
+    // we fill both in after computing the correct values.
+    let mut msg = BlockMessage {
+        block_hash: vec![0u8; 32], // placeholder — replaced below
         header: Header {
             parents_hash_list: parents.iter().map(|(hash, _)| hash.clone()).collect(),
             timestamp: 0,
@@ -749,11 +969,26 @@ fn build_test_block_message_with_state(
         justifications,
         sender: creator.to_vec(),
         seq_num: 0,
-        sig: signature,
+        sig: vec![], // placeholder — replaced below
         sig_algorithm: sig_algorithm.to_string(),
         shard_id: "0".to_string(),
         extra_bytes: vec![],
-    }
+    };
+
+    // Adapter-local snapshot hash — what
+    // `validate_adapter_content_hash` recomputes on ingest.
+    msg.block_hash = compute_adapter_snapshot_hash(&msg).to_vec();
+
+    // Sign the internal content hash that `message_to_block` produces so
+    // `validate_signature` passes. This is a *different* hash from the adapter
+    // block_hash above.
+    let content_hash = message_to_block(&msg)
+        .expect("test message should translate")
+        .identity
+        .content_hash;
+    msg.sig = sign(&content_hash, signing_key);
+
+    msg
 }
 
 fn build_test_block_with_predecessors(
@@ -788,4 +1023,26 @@ fn build_test_block_with_predecessors(
         },
         content,
     }
+}
+
+#[test]
+fn non_genesis_por_weights_require_an_audited_checkpoint() {
+    let validator = NodeId(vec![1]);
+    let initial_bonds = HashMap::from([(validator.clone(), 50)]);
+    let mut ingress = LiveIngress::with_consensus_view(
+        (),
+        initial_bonds.clone(),
+        CasperShardConf::default(),
+        "root",
+    );
+    let mut unaudited = ReputationState::new(1);
+    unaudited.set_reputation(validator, 100);
+
+    let error = ingress.apply_por_weights(&unaudited).unwrap_err();
+
+    assert_eq!(
+        error,
+        PorWeightActivationError::MissingReputationCheckpoint { round: 1 }
+    );
+    assert_eq!(ingress.bonds(), &initial_bonds);
 }

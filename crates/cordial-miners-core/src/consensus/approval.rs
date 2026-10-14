@@ -10,11 +10,16 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::block::Block;
 use crate::blocklace::Blocklace;
+#[cfg(feature = "trace")]
+use crate::consensus::round::depth;
+use crate::consensus::weight_snapshot::WeightSnapshot;
+#[cfg(feature = "trace")]
+use crate::trace::{self, AcceptApprovalEvent, TraceEvent};
 use crate::types::{BlockIdentity, NodeId};
 
 #[derive(Default)]
 pub(crate) struct ApprovalMemo {
-    observe_cache: HashMap<BlockIdentity, BTreeSet<BlockIdentity>>,
+    pub(crate) observe_cache: HashMap<BlockIdentity, BTreeSet<BlockIdentity>>,
     approves_cache: HashMap<(BlockIdentity, BlockIdentity), bool>,
     creator_blocks_cache: HashMap<NodeId, Vec<Block>>,
 }
@@ -43,6 +48,17 @@ pub(crate) fn approves_with_memo(
     }
 
     let result = approves_uncached(blocklace, approver, target, memo);
+    #[cfg(feature = "trace")]
+    if result && let Some(approver_block) = blocklace.get(approver) {
+        trace::emit(TraceEvent::AcceptApproval(AcceptApprovalEvent {
+            node_id: trace::hex(&approver_block.identity.creator.0),
+            wave: None,
+            round: depth(blocklace, approver).unwrap_or(0),
+            approver: trace::hex(&approver_block.identity.creator.0),
+            approver_hash: trace::hex(&approver_block.identity.content_hash),
+            target_hash: trace::hex(&target.content_hash),
+        }));
+    }
     memo.approves_cache.insert(cache_key, result);
     result
 }
@@ -57,45 +73,65 @@ fn approves_uncached(
         return false;
     }
 
-    // Observation in the blocklace is inclusive: a block observes itself and
-    // everything in its predecessor closure.
-    let observed = memo
-        .observe_cache
-        .entry(approver.clone())
-        .or_insert_with(|| blocklace.observe(approver));
+    // Populate approver's observe cache entry and check target visibility in a
+    // short block so the borrow on memo ends before we mutate observe_cache
+    // again inside the creator-blocks loop below.
+    {
+        let observed = memo
+            .observe_cache
+            .entry(approver.clone())
+            .or_insert_with(|| blocklace.observe(approver));
 
-    // Check if target is in the observed set
-    if !observed.contains(target) {
-        return false;
+        if !observed.contains(target) {
+            return false;
+        }
     }
 
-    // Get the target block to determine its creator
+    // Get the target block to determine its creator.
     let target_block = match blocklace.get(target) {
         Some(block) => block,
         None => return false,
     };
 
+    // Collect just the identities of other blocks by the same creator so we
+    // can iterate without holding a borrow on memo.creator_blocks_cache while
+    // mutating memo.observe_cache inside the loop.
+    let creator = target_block.identity.creator.clone();
+    if !memo.creator_blocks_cache.contains_key(&creator) {
+        memo.creator_blocks_cache
+            .insert(creator.clone(), blocklace.blocks_by(&creator));
+    }
+    let other_ids: Vec<BlockIdentity> = memo.creator_blocks_cache[&creator]
+        .iter()
+        .filter(|b| b.identity != *target)
+        .map(|b| b.identity.clone())
+        .collect();
+
     // Approval excludes any OTHER observed block by the same creator that is
-    // incomparable with the target. This follows the paper's "does not observe
-    // any equivocating block of the target" relation more closely than a
-    // same-round-only filter.
-    let creator_blocks = memo
-        .creator_blocks_cache
-        .entry(target_block.identity.creator.clone())
-        .or_insert_with(|| blocklace.blocks_by(&target_block.identity.creator));
-
-    for other_block in creator_blocks.iter() {
-        if other_block.identity == *target {
-            continue;
+    // incomparable with the target (i.e. an equivocating sibling).
+    //
+    // PERF: `precedes(a, b)` ≡ `a ∈ observe(b)`.  Both sides of the
+    // comparability test are answered in O(log N) via the observe_cache rather
+    // than with a fresh O(V×W) BFS per call.
+    for other_id in &other_ids {
+        // target_precedes_other  ≡  target ∈ observe(other)
+        if !memo.observe_cache.contains_key(other_id) {
+            memo.observe_cache
+                .insert(other_id.clone(), blocklace.observe(other_id));
         }
+        let target_precedes_other = memo.observe_cache[other_id].contains(target);
 
-        let target_precedes_other = blocklace.precedes(target, &other_block.identity);
-        let other_precedes_target = blocklace.precedes(&other_block.identity, target);
+        // other_precedes_target  ≡  other ∈ observe(target)
+        if !memo.observe_cache.contains_key(target) {
+            memo.observe_cache
+                .insert(target.clone(), blocklace.observe(target));
+        }
+        let other_precedes_target = memo.observe_cache[target].contains(other_id);
 
-        if !target_precedes_other
-            && !other_precedes_target
-            && observed.contains(&other_block.identity)
-        {
+        // approver_observes_other — re-borrow after the mutations above.
+        let approver_observes_other = memo.observe_cache[approver].contains(other_id);
+
+        if !target_precedes_other && !other_precedes_target && approver_observes_other {
             return false;
         }
     }
@@ -130,26 +166,36 @@ pub fn weighted_approving_creators(
     target: &BlockIdentity,
     bonds: &HashMap<NodeId, u64>,
 ) -> HashSet<NodeId> {
+    let weights = WeightSnapshot::from_bonds(bonds);
     let mut memo = ApprovalMemo::default();
-    weighted_approving_creators_with_memo(blocklace, blocks, target, bonds, &mut memo)
+    weighted_approving_creators_with_memo(blocklace, blocks, target, &weights, &mut memo)
 }
 
 pub(crate) fn weighted_approving_creators_with_memo(
     blocklace: &Blocklace,
     blocks: &HashSet<Block>,
     target: &BlockIdentity,
-    bonds: &HashMap<NodeId, u64>,
+    weights: &WeightSnapshot,
     memo: &mut ApprovalMemo,
 ) -> HashSet<NodeId> {
-    blocks
-        .iter()
+    // Approval checks emit trace evidence. Never let HashSet's randomized
+    // iteration order leak into the canonical event stream. The returned value
+    // is a HashSet, so this ordering changes only trace record order, not the
+    // approval result or its weighted support.
+    #[cfg(feature = "trace")]
+    let ordered_blocks = {
+        let mut blocks = blocks.iter().collect::<Vec<_>>();
+        blocks.sort_by_key(|block| block.identity.clone());
+        blocks
+    };
+    #[cfg(not(feature = "trace"))]
+    let ordered_blocks: Vec<_> = blocks.iter().collect();
+    ordered_blocks
+        .into_iter()
         .filter(|block| approves_with_memo(blocklace, &block.identity, target, memo))
         .filter_map(|block| {
             let creator = &block.identity.creator;
-            match bonds.get(creator).copied() {
-                Some(weight) if weight > 0 => Some(creator.clone()),
-                _ => None,
-            }
+            (weights.weight_of(creator) > 0).then(|| creator.clone())
         })
         .collect()
 }
