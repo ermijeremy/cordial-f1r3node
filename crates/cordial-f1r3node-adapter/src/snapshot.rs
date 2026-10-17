@@ -79,7 +79,8 @@ use std::collections::{HashMap, HashSet};
 use cordial_miners_core::blocklace::Blocklace;
 use cordial_miners_core::consensus::{
     OrderingCache, collect_validator_tips, compute_all_depths, fork_choice, last_round_of_wave,
-    latest_weighted_final_leader, wave_of_round, weighted_tau_with_cache, xsort,
+    latest_weighted_final_leader, wave_of_round, weighted_tau_suffix_with_cache,
+    weighted_tau_with_cache, xsort,
 };
 use cordial_miners_core::execution::{CordialBlockPayload, compute_deploys_in_scope};
 use cordial_miners_core::types::{BlockIdentity, NodeId};
@@ -507,6 +508,42 @@ pub(crate) fn ordered_block_identities_with_cache(
     .unwrap_or_default();
 
     (blocks, anchor)
+}
+
+/// Extend an existing weighted-tau prefix only for the multi-validator path.
+///
+/// The caller must establish that the blocklace changed exclusively through
+/// strict insertions deeper than the prior anchor's finality wave. A `None`
+/// result means the current final-leader chain does not verify that anchor.
+pub(crate) fn ordered_block_identities_with_verified_prefix(
+    blocklace: &Blocklace,
+    bonds: &HashMap<NodeId, u64>,
+    cache: &mut OrderingCache,
+    previous_prefix: &[BlockIdentity],
+    previous_anchor: &BlockIdentity,
+) -> Option<(Vec<BlockIdentity>, BlockIdentity)> {
+    let leaders = ordered_validators(bonds);
+    if leaders.len() < 2 || blocklace.checkpoint().is_some() || blocklace.has_trusted_boundaries() {
+        return None;
+    }
+
+    let leader_of_wave = |wave: u64| -> Option<NodeId> {
+        let idx = usize::try_from(wave).ok()? % leaders.len();
+        Some(leaders[idx].clone())
+    };
+
+    weighted_tau_suffix_with_cache(
+        blocklace,
+        CORDIAL_WAVELENGTH,
+        bonds,
+        0,
+        leader_of_wave,
+        previous_anchor,
+        previous_prefix,
+        cache,
+    )
+    .ok()
+    .flatten()
 }
 
 pub(crate) fn ordered_finalized_block_hashes_with_cache(

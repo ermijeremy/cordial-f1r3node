@@ -20,6 +20,9 @@ use cordial_f1r3node_adapter::shard_conf::CasperShardConf;
 use cordial_f1r3node_adapter::shared_ordered_output::ReadOrderedOutput;
 use cordial_f1r3node_adapter::snapshot::SnapshotError;
 use cordial_miners_core::Block;
+use cordial_miners_core::consensus::{
+    OrderingCache, latest_weighted_final_leader, weighted_tau, weighted_tau_suffix_with_cache,
+};
 use cordial_miners_core::crypto::hash_content;
 use cordial_miners_core::execution::{BlockState, CordialBlockPayload};
 use cordial_miners_core::types::{BlockContent, BlockIdentity, NodeId};
@@ -258,6 +261,162 @@ fn ordered_output_recomputes_when_wavelength_changes() {
 
     assert_eq!(changed_wavelength.wavelength, WAVELENGTH + 1);
     assert_ne!(changed_wavelength, first);
+}
+
+#[test]
+fn verified_prefix_extension_matches_full_weighted_tau() {
+    let validators = [validator(31), validator(32), validator(33), validator(34)];
+    let bonds: HashMap<NodeId, u64> = validators
+        .iter()
+        .cloned()
+        .map(|validator| (validator, 100))
+        .collect();
+    let mut ingress = live_ingress_weighted(
+        &validators
+            .iter()
+            .map(|validator| (validator.clone(), 100))
+            .collect::<Vec<_>>(),
+    );
+
+    let wave_0_leader = make_block(&validators[0], 0, 1, &[]);
+    let wave_0_round_1: Vec<Block> = validators[1..]
+        .iter()
+        .enumerate()
+        .map(|(index, validator)| {
+            make_block(
+                validator,
+                1,
+                u8::try_from(index + 2).expect("test tag should fit"),
+                std::slice::from_ref(&wave_0_leader.identity),
+            )
+        })
+        .collect();
+    let wave_0_round_1_ids: Vec<_> = wave_0_round_1
+        .iter()
+        .map(|block| block.identity.clone())
+        .collect();
+    let wave_0_round_2: Vec<Block> = validators[1..]
+        .iter()
+        .enumerate()
+        .map(|(index, validator)| {
+            make_block(
+                validator,
+                2,
+                u8::try_from(index + 5).expect("test tag should fit"),
+                &wave_0_round_1_ids,
+            )
+        })
+        .collect();
+
+    let mut wave_0 = vec![wave_0_leader];
+    wave_0.extend(wave_0_round_1);
+    wave_0.extend(wave_0_round_2.clone());
+    ingest_batch(&mut ingress, &wave_0);
+    let previous = ingress
+        .latest_finalized_ordered_output(WAVELENGTH)
+        .expect("wave 0 output should be computed");
+    assert_eq!(
+        previous.anchor.as_ref(),
+        Some(&wave_0[0].identity.consensus_identity())
+    );
+
+    let wave_1_leader = make_block(
+        &validators[1],
+        3,
+        8,
+        &wave_0_round_2
+            .iter()
+            .map(|block| block.identity.clone())
+            .collect::<Vec<_>>(),
+    );
+    let wave_1_round_1: Vec<Block> = [
+        validators[0].clone(),
+        validators[2].clone(),
+        validators[3].clone(),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(index, validator)| {
+        make_block(
+            validator,
+            4,
+            u8::try_from(index + 9).expect("test tag should fit"),
+            std::slice::from_ref(&wave_1_leader.identity),
+        )
+    })
+    .collect();
+    let wave_1_round_1_ids: Vec<_> = wave_1_round_1
+        .iter()
+        .map(|block| block.identity.clone())
+        .collect();
+    let wave_1_round_2: Vec<Block> = [
+        validators[0].clone(),
+        validators[2].clone(),
+        validators[3].clone(),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(index, validator)| {
+        make_block(
+            validator,
+            5,
+            u8::try_from(index + 12).expect("test tag should fit"),
+            &wave_1_round_1_ids,
+        )
+    })
+    .collect();
+
+    let mut wave_1 = vec![wave_1_leader];
+    wave_1.extend(wave_1_round_1);
+    wave_1.extend(wave_1_round_2);
+    ingest_batch(&mut ingress, &wave_1);
+
+    let incremental = ingress
+        .latest_finalized_ordered_output(WAVELENGTH)
+        .expect("verified later-wave extension should be computed");
+    let mut ordered_validators = validators.to_vec();
+    ordered_validators.sort();
+    let leader_of_wave = |wave: u64| {
+        let index = usize::try_from(wave).ok()? % ordered_validators.len();
+        Some(ordered_validators[index].clone())
+    };
+    let expected_blocks = weighted_tau(ingress.blocklace(), WAVELENGTH, &bonds, leader_of_wave)
+        .expect("independent full weighted tau should compute");
+    let expected_anchor =
+        latest_weighted_final_leader(ingress.blocklace(), WAVELENGTH, &bonds, leader_of_wave);
+
+    let mut cache = OrderingCache::default();
+    let verified_suffix = weighted_tau_suffix_with_cache(
+        ingress.blocklace(),
+        WAVELENGTH,
+        &bonds,
+        0,
+        leader_of_wave,
+        previous
+            .anchor
+            .as_ref()
+            .expect("first wave should have an anchor"),
+        &previous.blocks,
+        &mut cache,
+    )
+    .expect("verified suffix calculation should not fail");
+
+    assert!(
+        verified_suffix.is_some(),
+        "signature-independent anchor should validate against its signed DAG identity"
+    );
+    assert_eq!(incremental.blocks, expected_blocks);
+    assert_eq!(
+        verified_suffix
+            .expect("eligible extension should produce a suffix")
+            .0,
+        expected_blocks
+    );
+    assert_eq!(
+        incremental.anchor,
+        expected_anchor.map(|anchor| anchor.consensus_identity())
+    );
+    assert!(incremental.preserves_prefix(&previous));
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════

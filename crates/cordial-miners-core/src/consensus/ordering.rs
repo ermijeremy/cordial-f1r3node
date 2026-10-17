@@ -698,6 +698,84 @@ where
     ordered
 }
 
+/// Extend a previously computed weighted-tau prefix when its final leader is
+/// still on the current weighted-final leader chain.
+///
+/// `None` means that the prefix cannot be verified as a prefix of the current
+/// leader chain and the caller must use [`weighted_tau_with_cache`].
+pub fn weighted_tau_suffix_with_cache<F>(
+    blocklace: &Blocklace,
+    wavelength: u64,
+    bonds: &HashMap<NodeId, u64>,
+    leader_selection_id: u64,
+    leader_selection: F,
+    previous_anchor: &BlockIdentity,
+    previous_prefix: &[BlockIdentity],
+    cache: &mut OrderingCache,
+) -> Result<Option<(Vec<BlockIdentity>, BlockIdentity)>, OrderingError>
+where
+    F: Fn(u64) -> Option<NodeId> + Copy,
+{
+    sync_cache_generation(blocklace, cache);
+
+    if !previous_prefix
+        .last()
+        .is_some_and(|last| last.same_consensus_identity(previous_anchor))
+    {
+        return Ok(None);
+    }
+
+    let Some(anchor_round) = depth(blocklace, previous_anchor) else {
+        return Ok(None);
+    };
+    let Some(anchor_wave) = wave_of_round(anchor_round, wavelength) else {
+        return Ok(None);
+    };
+    if weighted_final_leader_for_wave(blocklace, anchor_wave, wavelength, bonds, leader_selection)
+        .is_none_or(|leader| !leader.same_consensus_identity(previous_anchor))
+    {
+        return Ok(None);
+    }
+
+    let Some(latest_leader) =
+        latest_weighted_final_leader(blocklace, wavelength, bonds, leader_selection)
+    else {
+        return Ok(None);
+    };
+
+    let weights = WeightSnapshot::from_bonds(bonds);
+    let config = WeightedTauConfig {
+        wavelength,
+        bonds,
+        weights: &weights,
+        leader_selection_id,
+        leader_selection,
+    };
+    let mut state = TauState {
+        emitted: previous_prefix
+            .iter()
+            .map(BlockIdentity::consensus_identity)
+            .collect(),
+        ordered: previous_prefix
+            .iter()
+            .map(BlockIdentity::consensus_identity)
+            .collect(),
+    };
+
+    if !weighted_tau_suffix_from_leader_cached(
+        blocklace,
+        &latest_leader,
+        &config,
+        cache,
+        previous_anchor,
+        &mut state,
+    )? {
+        return Ok(None);
+    }
+
+    Ok(Some((state.ordered, latest_leader)))
+}
+
 fn tau_from_leader<F>(
     blocklace: &Blocklace,
     leader: &BlockIdentity,
@@ -834,6 +912,52 @@ where
     }
 
     Ok(())
+}
+
+fn weighted_tau_suffix_from_leader_cached<'a, F>(
+    blocklace: &Blocklace,
+    leader: &BlockIdentity,
+    config: &WeightedTauConfig<'a, F>,
+    cache: &mut OrderingCache,
+    previous_anchor: &BlockIdentity,
+    state: &mut TauState,
+) -> Result<bool, OrderingError>
+where
+    F: Fn(u64) -> Option<NodeId> + Copy,
+{
+    if leader.same_consensus_identity(previous_anchor) {
+        return Ok(true);
+    }
+
+    if emit_weighted_checkpoint_prefix(blocklace, leader, state) {
+        return Ok(false);
+    }
+
+    let reaches_previous_anchor = if let Some(previous) =
+        weighted_previous_final_leader_cached(blocklace, leader, config, cache)
+    {
+        weighted_tau_suffix_from_leader_cached(
+            blocklace,
+            &previous,
+            config,
+            cache,
+            previous_anchor,
+            state,
+        )?
+    } else {
+        false
+    };
+    if !reaches_previous_anchor {
+        return Ok(false);
+    }
+
+    for id in sorted_approved_fragment(blocklace, leader, cache)? {
+        if state.emitted.insert(id.clone()) {
+            state.ordered.push(id);
+        }
+    }
+
+    Ok(true)
 }
 
 fn emit_checkpoint_prefix(

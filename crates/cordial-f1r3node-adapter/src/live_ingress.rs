@@ -32,7 +32,9 @@ use std::time::Instant;
 
 use cordial_miners_core::Block;
 use cordial_miners_core::blocklace::Blocklace;
-use cordial_miners_core::consensus::{OrderingCache, WeightSnapshot, depth, wave_of_round};
+use cordial_miners_core::consensus::{
+    OrderingCache, WeightSnapshot, depth, last_round_of_wave, wave_of_round,
+};
 use cordial_miners_core::crypto::CryptoVerifier;
 use cordial_miners_core::types::BlockIdentity;
 use cordial_miners_core::types::{BlockContent, NodeId};
@@ -47,7 +49,8 @@ use crate::shard_conf::CasperShardConf;
 use crate::shared_ordered_output::{ReadOrderedOutput, SharedOrderedOutput};
 use crate::snapshot::{
     CasperSnapshot, SnapshotError, build_snapshot, latest_finalized_block_id,
-    ordered_block_identities_with_cache, ordered_finalized_block_hashes_with_cache,
+    ordered_block_identities_with_cache, ordered_block_identities_with_verified_prefix,
+    ordered_finalized_block_hashes_with_cache,
 };
 /// High-level runtime phase for the live ingress adapter.
 ///
@@ -327,6 +330,7 @@ pub struct LiveIngress<A> {
     mirror: LiveBlocklaceMirror,
     ordering_cache: OrderingCache,
     last_finalized_output_fingerprint: Option<FinalizedOutputFingerprint>,
+    finalized_prefix_reuse: Option<FinalizedPrefixReuse>,
     shared_ordered_output: SharedOrderedOutput,
     bonds: HashMap<NodeId, u64>,
     shard_conf: CasperShardConf,
@@ -344,6 +348,17 @@ struct FinalizedOutputFingerprint {
     weights: WeightSnapshot,
 }
 
+struct FinalizedPrefixReuse {
+    fingerprint: FinalizedOutputFingerprint,
+    anchor: BlockIdentity,
+    anchor_wave_end: u64,
+    observed_generation: u64,
+    observed_mirrored_blocks: usize,
+    /// Strict closed-DAG insertions after this wave cannot change its witness
+    /// set or add ancestors to the already-computed leader fragments.
+    safe_append: bool,
+}
+
 impl<A> LiveIngress<A> {
     /// Create a new live-ingress wrapper around an adapter-side component.
     pub fn new(adapter: A) -> Self {
@@ -354,6 +369,7 @@ impl<A> LiveIngress<A> {
             mirror: LiveBlocklaceMirror::default(),
             ordering_cache: OrderingCache::default(),
             last_finalized_output_fingerprint: None,
+            finalized_prefix_reuse: None,
             shared_ordered_output: SharedOrderedOutput::new(),
             bonds: HashMap::new(),
             shard_conf: CasperShardConf::default(),
@@ -376,6 +392,7 @@ impl<A> LiveIngress<A> {
             mirror: LiveBlocklaceMirror::default(),
             ordering_cache: OrderingCache::default(),
             last_finalized_output_fingerprint: None,
+            finalized_prefix_reuse: None,
             shared_ordered_output: SharedOrderedOutput::new(),
             bonds,
             shard_conf,
@@ -420,6 +437,7 @@ impl<A> LiveIngress<A> {
             mirror,
             ordering_cache: OrderingCache::default(),
             last_finalized_output_fingerprint: None,
+            finalized_prefix_reuse: None,
             shared_ordered_output: SharedOrderedOutput::new(),
             bonds,
             shard_conf,
@@ -533,6 +551,7 @@ impl<A> LiveIngress<A> {
 
         self.bonds = weights.clone();
         self.ordering_cache = OrderingCache::default();
+        self.invalidate_finalized_prefix_reuse();
         Ok(())
     }
 
@@ -601,6 +620,7 @@ impl<A> LiveIngress<A> {
 
         self.bonds = next_weights;
         self.ordering_cache = OrderingCache::default();
+        self.invalidate_finalized_prefix_reuse();
         Ok(())
     }
 
@@ -612,6 +632,7 @@ impl<A> LiveIngress<A> {
         if self.bonds != bonds {
             self.bonds = bonds;
             self.ordering_cache = OrderingCache::default();
+            self.invalidate_finalized_prefix_reuse();
         }
     }
 
@@ -710,11 +731,18 @@ impl<A> LiveIngress<A> {
         }
 
         let ordering_started = Instant::now();
-        let (blocks, anchor) = {
-            let blocklace = self.mirror.blocklace();
-            let bonds = &self.bonds;
-            let cache = &mut self.ordering_cache;
-            ordered_block_identities_with_cache(blocklace, bonds, cache)
+        let incremental = self.try_extend_finalized_prefix(&fingerprint);
+        let (blocks, anchor, ordering_path) = match incremental {
+            Some((blocks, anchor)) => (blocks, Some(anchor), "verified_prefix"),
+            None => {
+                let (blocks, anchor) = {
+                    let blocklace = self.mirror.blocklace();
+                    let bonds = &self.bonds;
+                    let cache = &mut self.ordering_cache;
+                    ordered_block_identities_with_cache(blocklace, bonds, cache)
+                };
+                (blocks, anchor, "full")
+            }
         };
         let ordering_duration_us = ordering_started.elapsed().as_micros();
 
@@ -749,11 +777,118 @@ impl<A> LiveIngress<A> {
             poll_duration_us = poll_started.elapsed().as_micros(),
             cache_entries = self.ordering_cache.cached_entries(),
             ordering_skipped = false,
+            ordering_path,
             output_changed,
-            "PoR finalized output ordered"
+            "PoR finalized output computed"
         );
 
+        self.update_finalized_prefix_reuse(fingerprint, &output);
+
         Ok(output)
+    }
+
+    fn try_extend_finalized_prefix(
+        &mut self,
+        fingerprint: &FinalizedOutputFingerprint,
+    ) -> Option<(Vec<BlockIdentity>, BlockIdentity)> {
+        let reuse = self.finalized_prefix_reuse.as_ref()?;
+        if !reuse.safe_append
+            || reuse.observed_generation != fingerprint.generation
+            || reuse.observed_mirrored_blocks != fingerprint.mirrored_blocks
+            || reuse.fingerprint.generation == fingerprint.generation
+            || reuse.fingerprint.mirrored_blocks >= fingerprint.mirrored_blocks
+            || reuse.fingerprint.wavelength != fingerprint.wavelength
+            || reuse.fingerprint.weights != fingerprint.weights
+            || self.mirror.blocklace().has_trusted_boundaries()
+        {
+            return None;
+        }
+
+        let previous = self.shared_ordered_output.latest()?.blocks.clone();
+        let (blocks, anchor) = ordered_block_identities_with_verified_prefix(
+            self.mirror.blocklace(),
+            &self.bonds,
+            &mut self.ordering_cache,
+            &previous,
+            &reuse.anchor,
+        )?;
+        blocks.starts_with(&previous).then_some((blocks, anchor))
+    }
+
+    fn update_finalized_prefix_reuse(
+        &mut self,
+        fingerprint: FinalizedOutputFingerprint,
+        output: &OrderedFinalizedOutput,
+    ) {
+        let Some(anchor) = output.anchor.clone() else {
+            self.finalized_prefix_reuse = None;
+            return;
+        };
+        let Some(anchor_round) = depth(self.mirror.blocklace(), &anchor) else {
+            self.finalized_prefix_reuse = None;
+            return;
+        };
+        let Some(anchor_wave) = wave_of_round(anchor_round, fingerprint.wavelength) else {
+            self.finalized_prefix_reuse = None;
+            return;
+        };
+        let Some(anchor_wave_end) = last_round_of_wave(anchor_wave, fingerprint.wavelength) else {
+            self.finalized_prefix_reuse = None;
+            return;
+        };
+
+        self.finalized_prefix_reuse = Some(FinalizedPrefixReuse {
+            observed_generation: fingerprint.generation,
+            observed_mirrored_blocks: fingerprint.mirrored_blocks,
+            safe_append: !self.mirror.blocklace().has_trusted_boundaries(),
+            fingerprint,
+            anchor,
+            anchor_wave_end,
+        });
+    }
+
+    fn invalidate_finalized_prefix_reuse(&mut self) {
+        if let Some(reuse) = &mut self.finalized_prefix_reuse {
+            reuse.safe_append = false;
+        }
+    }
+
+    fn record_strict_mirror_update(
+        &mut self,
+        generation_before: u64,
+        mirrored_blocks_before: usize,
+        update: &MirrorUpdate,
+        inserted_block: &BlockIdentity,
+    ) {
+        let Some(reuse) = &mut self.finalized_prefix_reuse else {
+            return;
+        };
+
+        if update.disposition == MirrorDisposition::Duplicate {
+            return;
+        }
+
+        if update.disposition != MirrorDisposition::Applied
+            || reuse.observed_generation != generation_before
+            || reuse.observed_mirrored_blocks != mirrored_blocks_before
+        {
+            reuse.safe_append = false;
+            return;
+        }
+
+        let blocklace = self.mirror.blocklace();
+        let generation_delta = blocklace.generation().checked_sub(generation_before);
+        let mirrored_blocks_delta = blocklace.dom().len().checked_sub(mirrored_blocks_before);
+        if update.released_from_buffer == 0
+            && generation_delta == Some(1)
+            && mirrored_blocks_delta == Some(1)
+            && depth(blocklace, inserted_block).is_some_and(|round| round > reuse.anchor_wave_end)
+        {
+            reuse.observed_generation = blocklace.generation();
+            reuse.observed_mirrored_blocks = blocklace.dom().len();
+        } else {
+            reuse.safe_append = false;
+        }
     }
 
     fn advance_deploy_trace(&self, output: &OrderedFinalizedOutput) {
@@ -793,10 +928,21 @@ impl<A> LiveIngress<A> {
         self.adapter
             .on_block(block.clone())
             .map_err(LiveIngressError::Adapter)?;
-        let update = self
-            .mirror
-            .ingest(block.clone())
-            .map_err(LiveIngressError::Mirror)?;
+        let generation_before = self.mirror.blocklace().generation();
+        let mirrored_blocks_before = self.mirror.blocklace().dom().len();
+        let update = match self.mirror.ingest(block.clone()) {
+            Ok(update) => update,
+            Err(error) => {
+                self.invalidate_finalized_prefix_reuse();
+                return Err(LiveIngressError::Mirror(error));
+            }
+        };
+        self.record_strict_mirror_update(
+            generation_before,
+            mirrored_blocks_before,
+            &update,
+            &block.identity,
+        );
         // Correlate any traced deploys found in this block's payload.
         if let Some(tracer) = &self.deploy_tracer {
             correlate_block_payload(tracer, &block);
@@ -822,10 +968,16 @@ impl<A> LiveIngress<A> {
         self.adapter
             .on_block(block.clone())
             .map_err(LiveIngressError::Adapter)?;
-        let update = self
-            .mirror
-            .ingest_with_trusted_boundary(block.clone())
-            .map_err(LiveIngressError::Mirror)?;
+        let update = match self.mirror.ingest_with_trusted_boundary(block.clone()) {
+            Ok(update) => update,
+            Err(error) => {
+                self.invalidate_finalized_prefix_reuse();
+                return Err(LiveIngressError::Mirror(error));
+            }
+        };
+        if update.disposition != MirrorDisposition::Duplicate {
+            self.invalidate_finalized_prefix_reuse();
+        }
         // Correlate any traced deploys found in this block's payload.
         if let Some(tracer) = &self.deploy_tracer {
             correlate_block_payload(tracer, &block);
@@ -857,9 +1009,21 @@ where
             .on_block(block.clone())
             .map_err(LiveIngressError::Adapter)?;
 
-        self.mirror
-            .ingest(block.clone())
-            .map_err(|err| LiveIngressError::Adapter(anyhow::anyhow!(err)))?;
+        let generation_before = self.mirror.blocklace().generation();
+        let mirrored_blocks_before = self.mirror.blocklace().dom().len();
+        let update = match self.mirror.ingest(block.clone()) {
+            Ok(update) => update,
+            Err(error) => {
+                self.invalidate_finalized_prefix_reuse();
+                return Err(LiveIngressError::Adapter(anyhow::anyhow!(error)));
+            }
+        };
+        self.record_strict_mirror_update(
+            generation_before,
+            mirrored_blocks_before,
+            &update,
+            &block.identity,
+        );
 
         // Correlate traced deploy signatures found in the block body.
         if let Some(tracer) = &self.deploy_tracer {
@@ -908,4 +1072,51 @@ fn correlate_block_payload(tracer: &crate::deploy_trace::DeployTracer, block: &B
         .map(|pd| pd.deploy.signature.as_slice())
         .collect();
     tracer.correlate_block(sigs.into_iter(), block_hash, height);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn releasing_buffered_blocks_disables_verified_prefix_reuse() {
+        let mut ingress = LiveIngress::new(());
+        let bonds = HashMap::new();
+        let anchor = BlockIdentity {
+            content_hash: [1; 32],
+            creator: NodeId(vec![1]),
+            signature: Vec::new(),
+        };
+        ingress.finalized_prefix_reuse = Some(FinalizedPrefixReuse {
+            fingerprint: FinalizedOutputFingerprint {
+                generation: 0,
+                mirrored_blocks: 0,
+                wavelength: 3,
+                weights: WeightSnapshot::from_bonds(&bonds),
+            },
+            anchor: anchor.clone(),
+            anchor_wave_end: 2,
+            observed_generation: 0,
+            observed_mirrored_blocks: 0,
+            safe_append: true,
+        });
+
+        ingress.record_strict_mirror_update(
+            0,
+            0,
+            &MirrorUpdate {
+                disposition: MirrorDisposition::Applied,
+                released_from_buffer: 1,
+            },
+            &anchor,
+        );
+
+        assert!(
+            !ingress
+                .finalized_prefix_reuse
+                .as_ref()
+                .expect("test setup should retain reuse state")
+                .safe_append
+        );
+    }
 }
