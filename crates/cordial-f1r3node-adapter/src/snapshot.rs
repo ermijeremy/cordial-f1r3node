@@ -404,7 +404,7 @@ pub(crate) fn latest_finalized_block_id(
     }
 
     if leaders.len() == 1 && blocklace.checkpoint().is_none() {
-        match single_validator_leader(blocklace, &leaders[0]) {
+        match single_validator_leader(blocklace, &leaders[0], CORDIAL_WAVELENGTH) {
             SingleValidatorLeader::Fork => return None,
             SingleValidatorLeader::Found(leader) => return Some(leader),
             SingleValidatorLeader::Incomplete => {
@@ -456,6 +456,7 @@ pub(crate) fn ordered_finalized_block_hashes(
 pub(crate) fn ordered_block_identities_with_cache(
     blocklace: &Blocklace,
     bonds: &HashMap<NodeId, u64>,
+    wavelength: u64,
     cache: &mut OrderingCache,
 ) -> (Vec<BlockIdentity>, Option<BlockIdentity>) {
     let leaders = ordered_validators(bonds);
@@ -465,7 +466,7 @@ pub(crate) fn ordered_block_identities_with_cache(
     }
 
     if leaders.len() == 1 && blocklace.checkpoint().is_none() {
-        match single_validator_leader(blocklace, &leaders[0]) {
+        match single_validator_leader(blocklace, &leaders[0], wavelength) {
             SingleValidatorLeader::Fork => {
                 // Equivocation: this is a terminal answer, never fall
                 // through. Trusting weighted_tau here would let an
@@ -495,17 +496,10 @@ pub(crate) fn ordered_block_identities_with_cache(
         Some(leaders[idx].clone())
     };
 
-    let anchor = latest_weighted_final_leader(blocklace, CORDIAL_WAVELENGTH, bonds, leader_of_wave);
+    let anchor = latest_weighted_final_leader(blocklace, wavelength, bonds, leader_of_wave);
 
-    let blocks = weighted_tau_with_cache(
-        blocklace,
-        CORDIAL_WAVELENGTH,
-        bonds,
-        0,
-        leader_of_wave,
-        cache,
-    )
-    .unwrap_or_default();
+    let blocks = weighted_tau_with_cache(blocklace, wavelength, bonds, 0, leader_of_wave, cache)
+        .unwrap_or_default();
 
     (blocks, anchor)
 }
@@ -518,6 +512,7 @@ pub(crate) fn ordered_block_identities_with_cache(
 pub(crate) fn ordered_block_identities_with_verified_prefix(
     blocklace: &Blocklace,
     bonds: &HashMap<NodeId, u64>,
+    wavelength: u64,
     cache: &mut OrderingCache,
     previous_prefix: &[BlockIdentity],
     previous_anchor: &BlockIdentity,
@@ -534,7 +529,7 @@ pub(crate) fn ordered_block_identities_with_verified_prefix(
 
     weighted_tau_suffix_with_cache(
         blocklace,
-        CORDIAL_WAVELENGTH,
+        wavelength,
         bonds,
         0,
         leader_of_wave,
@@ -551,7 +546,8 @@ pub(crate) fn ordered_finalized_block_hashes_with_cache(
     bonds: &HashMap<NodeId, u64>,
     cache: &mut OrderingCache,
 ) -> Vec<Vec<u8>> {
-    let (blocks, _anchor) = ordered_block_identities_with_cache(blocklace, bonds, cache);
+    let (blocks, _anchor) =
+        ordered_block_identities_with_cache(blocklace, bonds, CORDIAL_WAVELENGTH, cache);
     blocks
         .into_iter()
         .map(|id| id.content_hash.to_vec())
@@ -570,8 +566,12 @@ pub(crate) fn ordered_finalized_output(
     blocklace: &Blocklace,
     bonds: &HashMap<NodeId, u64>,
 ) -> OrderedFinalizedOutput {
-    let (blocks, anchor) =
-        ordered_block_identities_with_cache(blocklace, bonds, &mut OrderingCache::default());
+    let (blocks, anchor) = ordered_block_identities_with_cache(
+        blocklace,
+        bonds,
+        CORDIAL_WAVELENGTH,
+        &mut OrderingCache::default(),
+    );
 
     OrderedFinalizedOutput::new(
         blocks,
@@ -611,18 +611,18 @@ enum SingleValidatorLeader {
 /// This is the single source of truth for "has this lone bonded validator
 /// equivocated, and if not, what did it finalize" — see
 /// [`SingleValidatorLeader`] and the module-level doc.
-fn single_validator_leader(blocklace: &Blocklace, validator: &NodeId) -> SingleValidatorLeader {
+fn single_validator_leader(
+    blocklace: &Blocklace,
+    validator: &NodeId,
+    wavelength: u64,
+) -> SingleValidatorLeader {
     let depths = compute_all_depths(blocklace);
 
     if has_same_round_fork(&depths, validator) {
         return SingleValidatorLeader::Fork;
     }
 
-    match latest_single_validator_finalized_block_id_from_depths(
-        &depths,
-        validator,
-        CORDIAL_WAVELENGTH,
-    ) {
+    match latest_single_validator_finalized_block_id_from_depths(&depths, validator, wavelength) {
         Some(leader) => SingleValidatorLeader::Found(leader),
         None => SingleValidatorLeader::Incomplete,
     }

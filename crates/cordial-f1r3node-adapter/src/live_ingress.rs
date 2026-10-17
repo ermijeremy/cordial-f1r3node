@@ -607,6 +607,7 @@ impl<A> LiveIngress<A> {
             let (prospective, _) = ordered_block_identities_with_cache(
                 self.blocklace(),
                 &next_weights,
+                previous.wavelength,
                 &mut prospective_cache,
             );
             let prospective: Vec<_> = prospective
@@ -739,7 +740,7 @@ impl<A> LiveIngress<A> {
                     let blocklace = self.mirror.blocklace();
                     let bonds = &self.bonds;
                     let cache = &mut self.ordering_cache;
-                    ordered_block_identities_with_cache(blocklace, bonds, cache)
+                    ordered_block_identities_with_cache(blocklace, bonds, wave_length, cache)
                 };
                 (blocks, anchor, "full")
             }
@@ -808,6 +809,7 @@ impl<A> LiveIngress<A> {
         let (blocks, anchor) = ordered_block_identities_with_verified_prefix(
             self.mirror.blocklace(),
             &self.bonds,
+            fingerprint.wavelength,
             &mut self.ordering_cache,
             &previous,
             &reuse.anchor,
