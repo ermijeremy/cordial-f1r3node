@@ -17,6 +17,8 @@ use cordial_f1r3node_adapter::grpc_ingest::BlocklaceAdapter;
 use cordial_f1r3node_adapter::live_ingress::LiveIngress;
 use cordial_f1r3node_adapter::ordered_output::OrderedFinalizedOutput;
 use cordial_f1r3node_adapter::shard_conf::CasperShardConf;
+use cordial_f1r3node_adapter::shared_ordered_output::ReadOrderedOutput;
+use cordial_f1r3node_adapter::snapshot::SnapshotError;
 use cordial_miners_core::Block;
 use cordial_miners_core::crypto::hash_content;
 use cordial_miners_core::execution::{BlockState, CordialBlockPayload};
@@ -214,6 +216,29 @@ fn ordered_output_recomputes_after_a_blocklace_or_weight_change() {
     assert_ne!(
         after_weight_change.computed_at_ns, after_new_block.computed_at_ns,
         "a changed weight snapshot must not return the previously published output"
+    );
+}
+
+#[test]
+fn ordered_output_recomputes_when_validator_membership_changes() {
+    let creator = validator(1);
+    let blocks = sequential_blocks(&creator, 6);
+    let mut ingress = live_ingress_single(&creator);
+    ingest_batch(&mut ingress, &blocks);
+
+    let before = ingress
+        .latest_finalized_ordered_output(WAVELENGTH)
+        .expect("ordered output should be computed");
+    ingress.set_bonds(HashMap::from([(validator(2), 100)]));
+
+    let error = ingress
+        .latest_finalized_ordered_output(WAVELENGTH)
+        .expect_err("new membership must not reuse the old validator's output");
+    assert_eq!(error, SnapshotError::OrderedOutputPrefixViolation);
+    assert_eq!(
+        ingress.ordered_output_reader().latest(),
+        Some(&before),
+        "a rejected membership-change output must leave the prior publication intact"
     );
 }
 

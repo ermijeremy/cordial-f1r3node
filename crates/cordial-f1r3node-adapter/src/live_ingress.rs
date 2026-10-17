@@ -609,7 +609,10 @@ impl<A> LiveIngress<A> {
     /// This is the Cordial membership/configuration boundary. PoR integration
     /// must use [`Self::apply_por_weights`] instead.
     pub fn set_bonds(&mut self, bonds: HashMap<NodeId, u64>) {
-        self.bonds = bonds;
+        if self.bonds != bonds {
+            self.bonds = bonds;
+            self.ordering_cache = OrderingCache::default();
+        }
     }
 
     pub fn bonds(&self) -> &HashMap<NodeId, u64> {

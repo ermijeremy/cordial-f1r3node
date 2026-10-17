@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
+use std::sync::Arc;
 
 use crate::block::Block;
 use crate::blocklace::Blocklace;
@@ -18,6 +19,9 @@ use crate::types::{BlockIdentity, NodeId};
 
 #[derive(Debug, Clone, Default)]
 pub struct OrderingCache {
+    /// Identity of the mirror used to populate this cache. Generation values
+    /// are only comparable within one Blocklace instance.
+    cache_blocklace_identity: Option<Arc<()>>,
     /// Blocklace generation the cached entries were computed against, paired
     /// with the DAG size at that time.
     ///
@@ -230,7 +234,12 @@ impl OrderingCache {
 
 fn sync_cache_generation(blocklace: &Blocklace, cache: &mut OrderingCache) {
     let generation = (blocklace.generation(), blocklace.dom().len());
-    if cache.cache_generation != generation {
+    let same_blocklace = cache
+        .cache_blocklace_identity
+        .as_ref()
+        .is_some_and(|identity| Arc::ptr_eq(identity, blocklace.cache_identity()));
+    if !same_blocklace || cache.cache_generation != generation {
+        cache.cache_blocklace_identity = Some(Arc::clone(blocklace.cache_identity()));
         cache.cache_generation = generation;
         cache.approved_blocks_by_leader.clear();
         cache.sorted_approved_by_leader.clear();
@@ -902,6 +911,55 @@ mod tests {
             .iter()
             .map(|(id, weight)| (node(*id), *weight))
             .collect()
+    }
+
+    #[test]
+    fn cache_invalidates_when_switching_between_same_generation_mirrors() {
+        let mut first = Blocklace::new();
+        first
+            .commit_validated(
+                block(1),
+                crate::types::BlockContent {
+                    payload: vec![1],
+                    predecessors: HashSet::new(),
+                },
+            )
+            .expect("first mirror block should commit");
+
+        let mut second = Blocklace::new();
+        second
+            .commit_validated(
+                block(2),
+                crate::types::BlockContent {
+                    payload: vec![2],
+                    predecessors: HashSet::new(),
+                },
+            )
+            .expect("second mirror block should commit");
+
+        assert_eq!(first.generation(), second.generation());
+        assert_eq!(first.dom().len(), second.dom().len());
+
+        let mut cache = OrderingCache::default();
+        sync_cache_generation(&first, &mut cache);
+        cache.tau_output_by_latest_leader.insert(
+            TauOutputCacheKey {
+                latest_leader: block(1),
+                wavelength: 3,
+                n: 4,
+                f: 1,
+                leader_selection_id: 0,
+            },
+            Ok(vec![block(1)]),
+        );
+
+        sync_cache_generation(&second, &mut cache);
+
+        assert!(
+            cache.tau_output_by_latest_leader.is_empty(),
+            "entries computed against another same-generation mirror must be discarded"
+        );
+        assert_eq!(cache.generation(), second.generation());
     }
 
     /// Two different weight tables forced to share a fingerprint, since a
