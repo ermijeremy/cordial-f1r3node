@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
+use cordial_miners_core::Block;
 use cordial_miners_core::blocklace::Blocklace;
-use cordial_miners_core::consensus::{weighted_tau, weighted_tau_with_cache, OrderingCache};
+use cordial_miners_core::consensus::{OrderingCache, weighted_tau, weighted_tau_with_cache};
 use cordial_miners_core::crypto::CryptoVerifier;
 use cordial_miners_core::types::{BlockContent, BlockIdentity, NodeId};
-use cordial_miners_core::Block;
 use sha2::{Digest, Sha256};
 
 const WAVELENGTH: u64 = 3;
