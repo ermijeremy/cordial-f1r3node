@@ -338,6 +338,7 @@ pub struct LiveIngress<A> {
     ordering_cache: OrderingCache,
     last_finalized_output_fingerprint: Option<FinalizedOutputFingerprint>,
     finalized_prefix_reuse: Option<FinalizedPrefixReuse>,
+    ordering_diagnostics: OrderingDiagnostics,
     shared_ordered_output: SharedOrderedOutput,
     bonds: HashMap<NodeId, u64>,
     shard_conf: CasperShardConf,
@@ -345,6 +346,19 @@ pub struct LiveIngress<A> {
     /// Optional deploy tracer. When set, block ingestion and finalized-output
     /// computation automatically advance the deploy lifecycle state machine.
     deploy_tracer: Option<DeployTracer>,
+}
+
+/// Ordering path and cache statistics for live inspection and benchmarks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OrderingDiagnostics {
+    pub last_path: Option<&'static str>,
+    pub last_fallback_reason: Option<&'static str>,
+    pub cache_entries: usize,
+    pub unchanged_polls: u64,
+    pub verified_prefix_extensions: u64,
+    pub full_recomputations: u64,
+    pub full_fallbacks: u64,
+    pub fallbacks_by_reason: HashMap<&'static str, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,6 +391,7 @@ impl<A> LiveIngress<A> {
             ordering_cache: OrderingCache::default(),
             last_finalized_output_fingerprint: None,
             finalized_prefix_reuse: None,
+            ordering_diagnostics: OrderingDiagnostics::default(),
             shared_ordered_output: SharedOrderedOutput::new(),
             bonds: HashMap::new(),
             shard_conf: CasperShardConf::default(),
@@ -400,6 +415,7 @@ impl<A> LiveIngress<A> {
             ordering_cache: OrderingCache::default(),
             last_finalized_output_fingerprint: None,
             finalized_prefix_reuse: None,
+            ordering_diagnostics: OrderingDiagnostics::default(),
             shared_ordered_output: SharedOrderedOutput::new(),
             bonds,
             shard_conf,
@@ -445,6 +461,7 @@ impl<A> LiveIngress<A> {
             ordering_cache: OrderingCache::default(),
             last_finalized_output_fingerprint: None,
             finalized_prefix_reuse: None,
+            ordering_diagnostics: OrderingDiagnostics::default(),
             shared_ordered_output: SharedOrderedOutput::new(),
             bonds,
             shard_conf,
@@ -515,6 +532,11 @@ impl<A> LiveIngress<A> {
     /// live ingress instance.
     pub fn ordered_output_reader(&self) -> &SharedOrderedOutput {
         &self.shared_ordered_output
+    }
+
+    /// Return finalized-ordering path and cache statistics.
+    pub fn ordering_diagnostics(&self) -> &OrderingDiagnostics {
+        &self.ordering_diagnostics
     }
 
     /// Persist the current finalized cursor to LMDB.
@@ -724,6 +746,10 @@ impl<A> LiveIngress<A> {
             && let Some(output) = self.shared_ordered_output.latest().cloned()
         {
             self.advance_deploy_trace(&output);
+            self.ordering_diagnostics.last_path = Some("unchanged");
+            self.ordering_diagnostics.last_fallback_reason = None;
+            self.ordering_diagnostics.cache_entries = self.ordering_cache.cached_entries();
+            self.ordering_diagnostics.unchanged_polls += 1;
             tracing::debug!(
                 generation = fingerprint.generation,
                 mirrored_blocks = fingerprint.mirrored_blocks,
@@ -740,7 +766,7 @@ impl<A> LiveIngress<A> {
         }
 
         let ordering_started = Instant::now();
-        let incremental = self
+        let (incremental, fallback_reason) = self
             .try_extend_finalized_prefix(&fingerprint)
             .map_err(SnapshotError::OrderingFailed)?;
         let (blocks, anchor, ordering_path) = match incremental {
@@ -780,6 +806,22 @@ impl<A> LiveIngress<A> {
         self.last_finalized_output_fingerprint = Some(fingerprint.clone());
         self.update_finalized_prefix_reuse(fingerprint.clone(), &output);
         self.advance_deploy_trace(&output);
+        self.ordering_diagnostics.cache_entries = self.ordering_cache.cached_entries();
+        self.ordering_diagnostics.last_path = Some(ordering_path);
+        self.ordering_diagnostics.last_fallback_reason = fallback_reason;
+        if ordering_path == "verified_prefix" {
+            self.ordering_diagnostics.verified_prefix_extensions += 1;
+        } else {
+            self.ordering_diagnostics.full_recomputations += 1;
+            if let Some(reason) = fallback_reason.filter(|reason| *reason != "no_saved_prefix") {
+                self.ordering_diagnostics.full_fallbacks += 1;
+                *self
+                    .ordering_diagnostics
+                    .fallbacks_by_reason
+                    .entry(reason)
+                    .or_default() += 1;
+            }
+        }
 
         tracing::debug!(
             generation = fingerprint.generation,
@@ -802,22 +844,36 @@ impl<A> LiveIngress<A> {
         &mut self,
         fingerprint: &FinalizedOutputFingerprint,
     ) -> Result<
-        Option<(Vec<BlockIdentity>, BlockIdentity)>,
+        (
+            Option<(Vec<BlockIdentity>, BlockIdentity)>,
+            Option<&'static str>,
+        ),
         cordial_miners_core::consensus::OrderingError,
     > {
         let Some(reuse) = self.finalized_prefix_reuse.as_ref() else {
-            return Ok(None);
+            return Ok((None, Some("no_saved_prefix")));
         };
-        if !reuse.safe_append
-            || reuse.observed_generation != fingerprint.generation
-            || reuse.observed_mirrored_blocks != fingerprint.mirrored_blocks
-            || reuse.fingerprint.generation == fingerprint.generation
-            || reuse.fingerprint.mirrored_blocks >= fingerprint.mirrored_blocks
-            || reuse.fingerprint.wavelength != fingerprint.wavelength
-            || reuse.fingerprint.weights != fingerprint.weights
-            || self.mirror.blocklace().has_trusted_boundaries()
-        {
-            return Ok(None);
+        let fallback_reason = if !reuse.safe_append {
+            Some("unsafe_mirror_mutation")
+        } else if reuse.observed_generation != fingerprint.generation {
+            Some("generation_mismatch")
+        } else if reuse.observed_mirrored_blocks != fingerprint.mirrored_blocks {
+            Some("mirror_size_mismatch")
+        } else if reuse.fingerprint.generation == fingerprint.generation {
+            Some("unchanged_generation")
+        } else if reuse.fingerprint.mirrored_blocks >= fingerprint.mirrored_blocks {
+            Some("no_mirror_growth")
+        } else if reuse.fingerprint.wavelength != fingerprint.wavelength {
+            Some("wavelength_changed")
+        } else if reuse.fingerprint.weights != fingerprint.weights {
+            Some("weights_changed")
+        } else if self.mirror.blocklace().has_trusted_boundaries() {
+            Some("trusted_boundary")
+        } else {
+            None
+        };
+        if let Some(reason) = fallback_reason {
+            return Ok((None, Some(reason)));
         }
 
         let Some(previous) = self
@@ -825,7 +881,7 @@ impl<A> LiveIngress<A> {
             .latest()
             .map(|output| output.blocks.clone())
         else {
-            return Ok(None);
+            return Ok((None, Some("missing_published_output")));
         };
         let Some((blocks, anchor)) = ordered_block_identities_with_verified_prefix(
             self.mirror.blocklace(),
@@ -836,9 +892,12 @@ impl<A> LiveIngress<A> {
             &reuse.anchor,
         )?
         else {
-            return Ok(None);
+            return Ok((None, Some("anchor_not_verified")));
         };
-        Ok(blocks.starts_with(&previous).then_some((blocks, anchor)))
+        if !blocks.starts_with(&previous) {
+            return Ok((None, Some("suffix_prefix_mismatch")));
+        }
+        Ok((Some((blocks, anchor)), None))
     }
 
     fn update_finalized_prefix_reuse(
