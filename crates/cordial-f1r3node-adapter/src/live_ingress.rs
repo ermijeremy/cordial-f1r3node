@@ -49,8 +49,8 @@ use crate::shard_conf::CasperShardConf;
 use crate::shared_ordered_output::{ReadOrderedOutput, SharedOrderedOutput};
 use crate::snapshot::{
     CasperSnapshot, SnapshotError, build_snapshot, latest_finalized_block_id,
-    ordered_block_identities_with_cache, ordered_block_identities_with_verified_prefix,
-    ordered_finalized_block_hashes_with_cache,
+    ordered_block_identities_with_verified_prefix, ordered_finalized_block_hashes_with_cache,
+    try_ordered_block_identities_with_cache,
 };
 /// High-level runtime phase for the live ingress adapter.
 ///
@@ -106,6 +106,7 @@ pub enum PorWeightActivationError {
     FinalizedWaveBehind { required: u64, available: u64 },
     ActivatedValidatorSetMismatch { configured: usize, recorded: usize },
     WouldRewriteFinalizedOutput,
+    OrderingFailed(cordial_miners_core::consensus::OrderingError),
 }
 
 impl std::fmt::Display for PorWeightActivationError {
@@ -137,6 +138,12 @@ impl std::fmt::Display for PorWeightActivationError {
                 f,
                 "PoR weight activation would rewrite the published Cordial finalized prefix"
             ),
+            Self::OrderingFailed(error) => {
+                write!(
+                    f,
+                    "cannot compute prospective finalized ordering: {error:?}"
+                )
+            }
             Self::ActivatedValidatorSetMismatch {
                 configured,
                 recorded,
@@ -604,12 +611,13 @@ impl<A> LiveIngress<A> {
 
         if let Some(previous) = self.shared_ordered_output.latest() {
             let mut prospective_cache = OrderingCache::default();
-            let (prospective, _) = ordered_block_identities_with_cache(
+            let (prospective, _) = try_ordered_block_identities_with_cache(
                 self.blocklace(),
                 &next_weights,
                 previous.wavelength,
                 &mut prospective_cache,
-            );
+            )
+            .map_err(PorWeightActivationError::OrderingFailed)?;
             let prospective: Vec<_> = prospective
                 .into_iter()
                 .map(|identity| identity.consensus_identity())
@@ -732,7 +740,9 @@ impl<A> LiveIngress<A> {
         }
 
         let ordering_started = Instant::now();
-        let incremental = self.try_extend_finalized_prefix(&fingerprint);
+        let incremental = self
+            .try_extend_finalized_prefix(&fingerprint)
+            .map_err(SnapshotError::OrderingFailed)?;
         let (blocks, anchor, ordering_path) = match incremental {
             Some((blocks, anchor)) => (blocks, Some(anchor), "verified_prefix"),
             None => {
@@ -740,7 +750,8 @@ impl<A> LiveIngress<A> {
                     let blocklace = self.mirror.blocklace();
                     let bonds = &self.bonds;
                     let cache = &mut self.ordering_cache;
-                    ordered_block_identities_with_cache(blocklace, bonds, wave_length, cache)
+                    try_ordered_block_identities_with_cache(blocklace, bonds, wave_length, cache)
+                        .map_err(SnapshotError::OrderingFailed)?
                 };
                 (blocks, anchor, "full")
             }
@@ -763,11 +774,12 @@ impl<A> LiveIngress<A> {
                 || previous.total_mirrored_blocks != output.total_mirrored_blocks
         });
 
-        self.advance_deploy_trace(&output);
         self.shared_ordered_output
             .update(output.clone())
             .map_err(|_| SnapshotError::OrderedOutputPrefixViolation)?;
         self.last_finalized_output_fingerprint = Some(fingerprint.clone());
+        self.update_finalized_prefix_reuse(fingerprint.clone(), &output);
+        self.advance_deploy_trace(&output);
 
         tracing::debug!(
             generation = fingerprint.generation,
@@ -783,16 +795,19 @@ impl<A> LiveIngress<A> {
             "PoR finalized output computed"
         );
 
-        self.update_finalized_prefix_reuse(fingerprint, &output);
-
         Ok(output)
     }
 
     fn try_extend_finalized_prefix(
         &mut self,
         fingerprint: &FinalizedOutputFingerprint,
-    ) -> Option<(Vec<BlockIdentity>, BlockIdentity)> {
-        let reuse = self.finalized_prefix_reuse.as_ref()?;
+    ) -> Result<
+        Option<(Vec<BlockIdentity>, BlockIdentity)>,
+        cordial_miners_core::consensus::OrderingError,
+    > {
+        let Some(reuse) = self.finalized_prefix_reuse.as_ref() else {
+            return Ok(None);
+        };
         if !reuse.safe_append
             || reuse.observed_generation != fingerprint.generation
             || reuse.observed_mirrored_blocks != fingerprint.mirrored_blocks
@@ -802,19 +817,28 @@ impl<A> LiveIngress<A> {
             || reuse.fingerprint.weights != fingerprint.weights
             || self.mirror.blocklace().has_trusted_boundaries()
         {
-            return None;
+            return Ok(None);
         }
 
-        let previous = self.shared_ordered_output.latest()?.blocks.clone();
-        let (blocks, anchor) = ordered_block_identities_with_verified_prefix(
+        let Some(previous) = self
+            .shared_ordered_output
+            .latest()
+            .map(|output| output.blocks.clone())
+        else {
+            return Ok(None);
+        };
+        let Some((blocks, anchor)) = ordered_block_identities_with_verified_prefix(
             self.mirror.blocklace(),
             &self.bonds,
             fingerprint.wavelength,
             &mut self.ordering_cache,
             &previous,
             &reuse.anchor,
-        )?;
-        blocks.starts_with(&previous).then_some((blocks, anchor))
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(blocks.starts_with(&previous).then_some((blocks, anchor)))
     }
 
     fn update_finalized_prefix_reuse(
@@ -1079,6 +1103,56 @@ fn correlate_block_payload(tracer: &crate::deploy_trace::DeployTracer, block: &B
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_publication_does_not_advance_fingerprint_or_prefix_state() {
+        let mut ingress = LiveIngress::new(());
+        let bonds = HashMap::new();
+        let saved_anchor = BlockIdentity {
+            content_hash: [1; 32],
+            creator: NodeId(vec![1]),
+            signature: Vec::new(),
+        };
+        let saved_fingerprint = FinalizedOutputFingerprint {
+            generation: 0,
+            mirrored_blocks: 0,
+            wavelength: 3,
+            weights: WeightSnapshot::from_bonds(&bonds),
+        };
+        ingress.finalized_prefix_reuse = Some(FinalizedPrefixReuse {
+            fingerprint: saved_fingerprint.clone(),
+            anchor: saved_anchor.clone(),
+            anchor_wave_end: 2,
+            observed_generation: 0,
+            observed_mirrored_blocks: 0,
+            safe_append: true,
+        });
+        let previously_published =
+            OrderedFinalizedOutput::new(vec![saved_anchor.clone()], Some(saved_anchor), 3, 1, 1);
+        ingress
+            .shared_ordered_output
+            .update(previously_published.clone())
+            .expect("test output should be publishable");
+
+        assert_eq!(
+            ingress.latest_finalized_ordered_output(3),
+            Err(SnapshotError::OrderedOutputPrefixViolation)
+        );
+        assert_eq!(
+            ingress.shared_ordered_output.latest(),
+            Some(&previously_published)
+        );
+        assert!(
+            ingress.last_finalized_output_fingerprint.is_none(),
+            "a failed publication must not mark its mirror fingerprint as published"
+        );
+        let reuse = ingress
+            .finalized_prefix_reuse
+            .as_ref()
+            .expect("failed publication must not replace existing prefix state");
+        assert_eq!(reuse.fingerprint, saved_fingerprint);
+        assert!(reuse.safe_append);
+    }
 
     #[test]
     fn releasing_buffered_blocks_disables_verified_prefix_reuse() {

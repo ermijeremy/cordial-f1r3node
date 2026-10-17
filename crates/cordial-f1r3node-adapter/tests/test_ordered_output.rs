@@ -297,6 +297,42 @@ fn unchanged_ordered_output_poll_reuses_the_published_result() {
 }
 
 #[test]
+fn duplicate_ingestion_does_not_invalidate_or_recompute_ordered_output() {
+    let validators = [validator(91), validator(92), validator(93), validator(94)];
+    let mut ingress = live_ingress_weighted(
+        &validators
+            .iter()
+            .cloned()
+            .map(|id| (id, 100))
+            .collect::<Vec<_>>(),
+    );
+    let (wave_zero, _) = weighted_wave_zero(&validators, 100);
+    ingest_batch(&mut ingress, &wave_zero);
+    let before = ingress
+        .latest_finalized_ordered_output(WAVELENGTH)
+        .expect("initial ordered output should compute");
+    let generation_before = ingress.blocklace().generation();
+
+    let duplicate = ingress
+        .ingest_trusted_block(wave_zero[0].clone())
+        .expect("duplicate ingestion should be accepted as a no-op");
+    assert_eq!(
+        duplicate.disposition,
+        cordial_f1r3node_adapter::live_ingress::MirrorDisposition::Duplicate
+    );
+    assert_eq!(ingress.blocklace().generation(), generation_before);
+
+    let after = ingress
+        .latest_finalized_ordered_output(WAVELENGTH)
+        .expect("duplicate ingestion must leave ordering available");
+    assert_eq!(after, before);
+    assert_eq!(
+        after.computed_at_ns, before.computed_at_ns,
+        "duplicate ingestion should keep the published result without recomputing"
+    );
+}
+
+#[test]
 fn unchanged_empty_ordered_output_poll_reuses_the_published_result() {
     let mut ingress = live_ingress_single(&validator(1));
 

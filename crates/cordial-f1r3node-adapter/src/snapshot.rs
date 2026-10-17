@@ -78,9 +78,9 @@ use std::collections::{HashMap, HashSet};
 
 use cordial_miners_core::blocklace::Blocklace;
 use cordial_miners_core::consensus::{
-    OrderingCache, collect_validator_tips, compute_all_depths, fork_choice, last_round_of_wave,
-    latest_weighted_final_leader, wave_of_round, weighted_tau_suffix_with_cache,
-    weighted_tau_with_cache, xsort,
+    OrderingCache, OrderingError, collect_validator_tips, compute_all_depths, fork_choice,
+    last_round_of_wave, latest_weighted_final_leader, wave_of_round,
+    weighted_tau_suffix_with_cache, weighted_tau_with_cache, xsort,
 };
 use cordial_miners_core::execution::{CordialBlockPayload, compute_deploys_in_scope};
 use cordial_miners_core::types::{BlockIdentity, NodeId};
@@ -188,6 +188,9 @@ pub enum SnapshotError {
     /// Updating a shared ordered-output reader would rewrite a previously
     /// published finalized prefix.
     OrderedOutputPrefixViolation,
+
+    /// Weighted tau could not produce a complete ordering.
+    OrderingFailed(OrderingError),
 }
 
 /// Build a [`CasperSnapshot`] from the current blocklace state.
@@ -459,10 +462,19 @@ pub(crate) fn ordered_block_identities_with_cache(
     wavelength: u64,
     cache: &mut OrderingCache,
 ) -> (Vec<BlockIdentity>, Option<BlockIdentity>) {
+    try_ordered_block_identities_with_cache(blocklace, bonds, wavelength, cache).unwrap_or_default()
+}
+
+pub(crate) fn try_ordered_block_identities_with_cache(
+    blocklace: &Blocklace,
+    bonds: &HashMap<NodeId, u64>,
+    wavelength: u64,
+    cache: &mut OrderingCache,
+) -> Result<(Vec<BlockIdentity>, Option<BlockIdentity>), OrderingError> {
     let leaders = ordered_validators(bonds);
 
     if leaders.is_empty() {
-        return (Vec::new(), None);
+        return Ok((Vec::new(), None));
     }
 
     if leaders.len() == 1 && blocklace.checkpoint().is_none() {
@@ -472,7 +484,7 @@ pub(crate) fn ordered_block_identities_with_cache(
                 // through. Trusting weighted_tau here would let an
                 // equivocating validator's frontier drive the
                 // ordering/anchor.
-                return (Vec::new(), None);
+                return Ok((Vec::new(), None));
             }
             SingleValidatorLeader::Found(leader) => {
                 let observed = blocklace
@@ -480,8 +492,8 @@ pub(crate) fn ordered_block_identities_with_cache(
                     .into_iter()
                     .filter_map(|id| blocklace.get(&id))
                     .collect();
-                let blocks = xsort(&observed).unwrap_or_default();
-                return (blocks, Some(leader));
+                let blocks = xsort(&observed)?;
+                return Ok((blocks, Some(leader)));
             }
             SingleValidatorLeader::Incomplete => {
                 // No complete wave yet for this validator — genuinely fall
@@ -498,10 +510,9 @@ pub(crate) fn ordered_block_identities_with_cache(
 
     let anchor = latest_weighted_final_leader(blocklace, wavelength, bonds, leader_of_wave);
 
-    let blocks = weighted_tau_with_cache(blocklace, wavelength, bonds, 0, leader_of_wave, cache)
-        .unwrap_or_default();
+    let blocks = weighted_tau_with_cache(blocklace, wavelength, bonds, 0, leader_of_wave, cache)?;
 
-    (blocks, anchor)
+    Ok((blocks, anchor))
 }
 
 /// Extend an existing weighted-tau prefix only for the multi-validator path.
@@ -516,10 +527,10 @@ pub(crate) fn ordered_block_identities_with_verified_prefix(
     cache: &mut OrderingCache,
     previous_prefix: &[BlockIdentity],
     previous_anchor: &BlockIdentity,
-) -> Option<(Vec<BlockIdentity>, BlockIdentity)> {
+) -> Result<Option<(Vec<BlockIdentity>, BlockIdentity)>, OrderingError> {
     let leaders = ordered_validators(bonds);
     if leaders.len() < 2 || blocklace.checkpoint().is_some() || blocklace.has_trusted_boundaries() {
-        return None;
+        return Ok(None);
     }
 
     let leader_of_wave = |wave: u64| -> Option<NodeId> {
@@ -537,8 +548,6 @@ pub(crate) fn ordered_block_identities_with_verified_prefix(
         previous_prefix,
         cache,
     )
-    .ok()
-    .flatten()
 }
 
 pub(crate) fn ordered_finalized_block_hashes_with_cache(
