@@ -28,10 +28,11 @@
 //! Those come in follow-up increments.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use cordial_miners_core::Block;
 use cordial_miners_core::blocklace::Blocklace;
-use cordial_miners_core::consensus::{OrderingCache, depth, wave_of_round};
+use cordial_miners_core::consensus::{OrderingCache, WeightSnapshot, depth, wave_of_round};
 use cordial_miners_core::crypto::CryptoVerifier;
 use cordial_miners_core::types::BlockIdentity;
 use cordial_miners_core::types::{BlockContent, NodeId};
@@ -325,6 +326,7 @@ pub struct LiveIngress<A> {
     mapper: GrpcBlockMapper,
     mirror: LiveBlocklaceMirror,
     ordering_cache: OrderingCache,
+    last_finalized_output_fingerprint: Option<FinalizedOutputFingerprint>,
     shared_ordered_output: SharedOrderedOutput,
     bonds: HashMap<NodeId, u64>,
     shard_conf: CasperShardConf,
@@ -332,6 +334,14 @@ pub struct LiveIngress<A> {
     /// Optional deploy tracer. When set, block ingestion and finalized-output
     /// computation automatically advance the deploy lifecycle state machine.
     deploy_tracer: Option<DeployTracer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FinalizedOutputFingerprint {
+    generation: u64,
+    mirrored_blocks: usize,
+    wavelength: u64,
+    weights: WeightSnapshot,
 }
 
 impl<A> LiveIngress<A> {
@@ -343,6 +353,7 @@ impl<A> LiveIngress<A> {
             mapper: GrpcBlockMapper::new(),
             mirror: LiveBlocklaceMirror::default(),
             ordering_cache: OrderingCache::default(),
+            last_finalized_output_fingerprint: None,
             shared_ordered_output: SharedOrderedOutput::new(),
             bonds: HashMap::new(),
             shard_conf: CasperShardConf::default(),
@@ -364,6 +375,7 @@ impl<A> LiveIngress<A> {
             mapper: GrpcBlockMapper::new(),
             mirror: LiveBlocklaceMirror::default(),
             ordering_cache: OrderingCache::default(),
+            last_finalized_output_fingerprint: None,
             shared_ordered_output: SharedOrderedOutput::new(),
             bonds,
             shard_conf,
@@ -407,6 +419,7 @@ impl<A> LiveIngress<A> {
             mapper: GrpcBlockMapper::new(),
             mirror,
             ordering_cache: OrderingCache::default(),
+            last_finalized_output_fingerprint: None,
             shared_ordered_output: SharedOrderedOutput::new(),
             bonds,
             shard_conf,
@@ -663,24 +676,84 @@ impl<A> LiveIngress<A> {
         &mut self,
         wave_length: u64,
     ) -> Result<OrderedFinalizedOutput, SnapshotError> {
+        let poll_started = Instant::now();
+        let blocklace = self.mirror.blocklace();
+        let fingerprint = FinalizedOutputFingerprint {
+            generation: blocklace.generation(),
+            mirrored_blocks: blocklace.dom().len(),
+            wavelength: wave_length,
+            weights: WeightSnapshot::from_bonds(&self.bonds),
+        };
+
+        // Generation detects all structural mutations (including equal-size
+        // prune/insert); the complete weight snapshot avoids hash-only reuse.
+        if self.last_finalized_output_fingerprint.as_ref() == Some(&fingerprint)
+            && let Some(output) = self.shared_ordered_output.latest().cloned()
+        {
+            self.advance_deploy_trace(&output);
+            tracing::debug!(
+                generation = fingerprint.generation,
+                mirrored_blocks = fingerprint.mirrored_blocks,
+                wavelength = fingerprint.wavelength,
+                weight_snapshot = %fingerprint.weights.id(),
+                ordering_duration_us = 0u128,
+                poll_duration_us = poll_started.elapsed().as_micros(),
+                cache_entries = self.ordering_cache.cached_entries(),
+                ordering_skipped = true,
+                output_changed = false,
+                "PoR finalized output unchanged; reusing published result"
+            );
+            return Ok(output);
+        }
+
+        let ordering_started = Instant::now();
         let (blocks, anchor) = {
             let blocklace = self.mirror.blocklace();
             let bonds = &self.bonds;
             let cache = &mut self.ordering_cache;
             ordered_block_identities_with_cache(blocklace, bonds, cache)
         };
-
-        let total_mirrored_blocks = self.mirror.blocklace().dom().len();
+        let ordering_duration_us = ordering_started.elapsed().as_micros();
 
         let output = OrderedFinalizedOutput::new(
             blocks,
             anchor,
             wave_length,
             self.bonds.len(),
-            total_mirrored_blocks,
+            fingerprint.mirrored_blocks,
         );
 
-        // Advance deploy traces to FinalizedOrdered for blocks in this output.
+        let output_changed = self.shared_ordered_output.latest().is_none_or(|previous| {
+            previous.blocks != output.blocks
+                || previous.anchor != output.anchor
+                || previous.wavelength != output.wavelength
+                || previous.bond_count != output.bond_count
+                || previous.total_mirrored_blocks != output.total_mirrored_blocks
+        });
+
+        self.advance_deploy_trace(&output);
+        self.shared_ordered_output
+            .update(output.clone())
+            .map_err(|_| SnapshotError::OrderedOutputPrefixViolation)?;
+        self.last_finalized_output_fingerprint = Some(fingerprint.clone());
+
+        tracing::debug!(
+            generation = fingerprint.generation,
+            mirrored_blocks = fingerprint.mirrored_blocks,
+            wavelength = fingerprint.wavelength,
+            weight_snapshot = %fingerprint.weights.id(),
+            ordering_duration_us,
+            poll_duration_us = poll_started.elapsed().as_micros(),
+            cache_entries = self.ordering_cache.cached_entries(),
+            ordering_skipped = false,
+            output_changed,
+            "PoR finalized output ordered"
+        );
+
+        Ok(output)
+    }
+
+    fn advance_deploy_trace(&self, output: &OrderedFinalizedOutput) {
         if let Some(tracer) = &self.deploy_tracer {
             let finalized_hashes: Vec<String> =
                 output.block_hashes().into_iter().map(hex::encode).collect();
@@ -688,12 +761,6 @@ impl<A> LiveIngress<A> {
                 tracer.correlate_finalized_output(&finalized_hashes, &anchor_id.content_hash);
             }
         }
-
-        self.shared_ordered_output
-            .update(output.clone())
-            .map_err(|_| SnapshotError::OrderedOutputPrefixViolation)?;
-
-        Ok(output)
     }
 
     /// Ingest and persist a trusted block.

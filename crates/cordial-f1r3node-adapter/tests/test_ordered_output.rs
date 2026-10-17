@@ -148,6 +148,60 @@ fn assert_monotonic(earlier: &OrderedFinalizedOutput, later: &OrderedFinalizedOu
     );
 }
 
+#[test]
+fn unchanged_ordered_output_poll_reuses_the_published_result() {
+    let creator = validator(1);
+    let blocks = sequential_blocks(&creator, 6);
+    let mut ingress = live_ingress_single(&creator);
+    ingest_batch(&mut ingress, &blocks);
+
+    let first = ingress
+        .latest_finalized_ordered_output(WAVELENGTH)
+        .expect("first ordered output should be computed");
+    let second = ingress
+        .latest_finalized_ordered_output(WAVELENGTH)
+        .expect("unchanged poll should return the published output");
+
+    assert_eq!(second, first);
+    assert_eq!(
+        second.computed_at_ns, first.computed_at_ns,
+        "an unchanged poll should reuse the prior output rather than recomputing it"
+    );
+}
+
+#[test]
+fn ordered_output_recomputes_after_a_blocklace_or_weight_change() {
+    let creator = validator(1);
+    let blocks = sequential_blocks(&creator, 7);
+    let mut ingress = live_ingress_single(&creator);
+    ingest_batch(&mut ingress, &blocks[..6]);
+
+    let before_new_block = ingress
+        .latest_finalized_ordered_output(WAVELENGTH)
+        .expect("initial ordered output should be computed");
+    ingress
+        .ingest_trusted_block(blocks[6].clone())
+        .expect("new block should enter the mirror");
+    let after_new_block = ingress
+        .latest_finalized_ordered_output(WAVELENGTH)
+        .expect("blocklace change should trigger ordering");
+    assert_eq!(after_new_block.total_mirrored_blocks, 7);
+    assert_ne!(after_new_block, before_new_block);
+
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    ingress.set_bonds(HashMap::from([(creator, 101)]));
+    let after_weight_change = ingress
+        .latest_finalized_ordered_output(WAVELENGTH)
+        .expect("weight change should trigger ordering");
+
+    assert_eq!(after_weight_change.blocks, after_new_block.blocks);
+    assert_eq!(after_weight_change.anchor, after_new_block.anchor);
+    assert_ne!(
+        after_weight_change.computed_at_ns, after_new_block.computed_at_ns,
+        "a changed weight snapshot must not use the unchanged-mirror fast path"
+    );
+}
+
 // ════════════════════════════════════════════════════════════════════════════════════════
 //  Single-validator ordered-output checks
 // ════════════════════════════════════════════════════════════════════════════════════════
