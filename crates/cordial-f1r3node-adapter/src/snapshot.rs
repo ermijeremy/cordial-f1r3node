@@ -78,9 +78,9 @@ use std::collections::{HashMap, HashSet};
 
 use cordial_miners_core::blocklace::Blocklace;
 use cordial_miners_core::consensus::{
-    OrderingCache, OrderingError, collect_validator_tips, compute_all_depths, fork_choice,
-    last_round_of_wave, latest_weighted_final_leader, wave_of_round,
-    weighted_tau_suffix_with_cache, weighted_tau_with_cache, xsort,
+    OrderingCache, OrderingError, WeightedTauSuffixContext, collect_validator_tips,
+    compute_all_depths, fork_choice, last_round_of_wave, latest_weighted_final_leader,
+    wave_of_round, weighted_tau_suffix_with_cache, weighted_tau_with_cache, xsort,
 };
 use cordial_miners_core::execution::{CordialBlockPayload, compute_deploys_in_scope};
 use cordial_miners_core::types::{BlockIdentity, NodeId};
@@ -540,10 +540,12 @@ pub(crate) fn ordered_block_identities_with_verified_prefix(
 
     weighted_tau_suffix_with_cache(
         blocklace,
-        wavelength,
-        bonds,
-        0,
-        leader_of_wave,
+        WeightedTauSuffixContext {
+            wavelength,
+            bonds,
+            leader_selection_id: 0,
+            leader_selection: leader_of_wave,
+        },
         previous_anchor,
         previous_prefix,
         cache,

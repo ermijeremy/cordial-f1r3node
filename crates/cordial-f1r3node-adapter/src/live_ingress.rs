@@ -380,6 +380,12 @@ struct FinalizedPrefixReuse {
     safe_append: bool,
 }
 
+type FinalizedPrefixExtension = (Vec<BlockIdentity>, BlockIdentity);
+type FinalizedPrefixExtensionAttempt = Result<
+    (Option<FinalizedPrefixExtension>, Option<&'static str>),
+    cordial_miners_core::consensus::OrderingError,
+>;
+
 impl<A> LiveIngress<A> {
     /// Create a new live-ingress wrapper around an adapter-side component.
     pub fn new(adapter: A) -> Self {
@@ -843,13 +849,7 @@ impl<A> LiveIngress<A> {
     fn try_extend_finalized_prefix(
         &mut self,
         fingerprint: &FinalizedOutputFingerprint,
-    ) -> Result<
-        (
-            Option<(Vec<BlockIdentity>, BlockIdentity)>,
-            Option<&'static str>,
-        ),
-        cordial_miners_core::consensus::OrderingError,
-    > {
+    ) -> FinalizedPrefixExtensionAttempt {
         let Some(reuse) = self.finalized_prefix_reuse.as_ref() else {
             return Ok((None, Some("no_saved_prefix")));
         };

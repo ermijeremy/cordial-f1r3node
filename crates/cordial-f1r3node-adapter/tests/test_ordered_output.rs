@@ -21,8 +21,8 @@ use cordial_f1r3node_adapter::shared_ordered_output::ReadOrderedOutput;
 use cordial_f1r3node_adapter::snapshot::SnapshotError;
 use cordial_miners_core::Block;
 use cordial_miners_core::consensus::{
-    OrderingCache, compute_all_depths, latest_weighted_final_leader, weighted_tau,
-    weighted_tau_suffix_with_cache, xsort,
+    OrderingCache, WeightedTauSuffixContext, compute_all_depths, latest_weighted_final_leader,
+    weighted_tau, weighted_tau_suffix_with_cache, xsort,
 };
 use cordial_miners_core::crypto::hash_content;
 use cordial_miners_core::execution::{BlockState, CordialBlockPayload};
@@ -605,10 +605,12 @@ fn verified_prefix_extension_matches_full_weighted_tau() {
     let mut cache = OrderingCache::default();
     let verified_suffix = weighted_tau_suffix_with_cache(
         ingress.blocklace(),
-        WAVELENGTH,
-        &bonds,
-        0,
-        leader_of_wave,
+        WeightedTauSuffixContext {
+            wavelength: WAVELENGTH,
+            bonds: &bonds,
+            leader_selection_id: 0,
+            leader_selection: leader_of_wave,
+        },
         previous
             .anchor
             .as_ref()
@@ -778,13 +780,15 @@ fn restart_with_stale_same_size_prefix_falls_back_to_full_ordering() {
     let mut cache = OrderingCache::default();
     let stale_extension = weighted_tau_suffix_with_cache(
         restarted_ingress.blocklace(),
-        WAVELENGTH,
-        &bonds,
-        0,
-        |wave| {
-            let mut ordered = validators.to_vec();
-            ordered.sort();
-            Some(ordered[usize::try_from(wave).ok()? % ordered.len()].clone())
+        WeightedTauSuffixContext {
+            wavelength: WAVELENGTH,
+            bonds: &bonds,
+            leader_selection_id: 0,
+            leader_selection: |wave| {
+                let mut ordered = validators.to_vec();
+                ordered.sort();
+                Some(ordered[usize::try_from(wave).ok()? % ordered.len()].clone())
+            },
         },
         stale_output
             .anchor

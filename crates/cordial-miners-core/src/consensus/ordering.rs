@@ -108,6 +108,17 @@ where
     leader_selection: F,
 }
 
+/// Inputs shared by a cached weighted-tau suffix calculation.
+pub struct WeightedTauSuffixContext<'a, F>
+where
+    F: Fn(u64) -> Option<NodeId> + Copy,
+{
+    pub wavelength: u64,
+    pub bonds: &'a HashMap<NodeId, u64>,
+    pub leader_selection_id: u64,
+    pub leader_selection: F,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrderingError {
     CycleDetected,
@@ -705,10 +716,7 @@ where
 /// leader chain and the caller must use [`weighted_tau_with_cache`].
 pub fn weighted_tau_suffix_with_cache<F>(
     blocklace: &Blocklace,
-    wavelength: u64,
-    bonds: &HashMap<NodeId, u64>,
-    leader_selection_id: u64,
-    leader_selection: F,
+    context: WeightedTauSuffixContext<'_, F>,
     previous_anchor: &BlockIdentity,
     previous_prefix: &[BlockIdentity],
     cache: &mut OrderingCache,
@@ -724,6 +732,13 @@ where
     {
         return Ok(None);
     }
+
+    let WeightedTauSuffixContext {
+        wavelength,
+        bonds,
+        leader_selection_id,
+        leader_selection,
+    } = context;
 
     let Some(anchor_round) = depth(blocklace, previous_anchor) else {
         return Ok(None);
