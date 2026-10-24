@@ -14,8 +14,11 @@
 //! the block itself is included, unsigned predecessor references resolve only
 //! when unique, and the checkpoint boundary block is included but its
 //! predecessors are not expanded.
+//!
+//! Approval (Definition 18) is evaluated exactly from the index, including for
+//! creators that equivocate, so no per-block closure set is ever materialised.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::blocklace::Blocklace;
 use crate::types::{BlockIdentity, NodeId};
@@ -103,6 +106,23 @@ impl Closure {
             .windows(2)
             .all(|pair| pair[0] != pair[1] && self.observes(pair[1], pair[0]))
     }
+
+    /// For each member, the other members it is incomparable with (neither
+    /// observes the other). Members with no such sibling are omitted.
+    pub(crate) fn incomparable_pairs(&self, members: &[usize]) -> Vec<(usize, Vec<usize>)> {
+        let mut out = Vec::new();
+        for &a in members {
+            let conflicts: Vec<usize> = members
+                .iter()
+                .copied()
+                .filter(|&b| b != a && !self.observes(a, b) && !self.observes(b, a))
+                .collect();
+            if !conflicts.is_empty() {
+                out.push((a, conflicts));
+            }
+        }
+        out
+    }
 }
 
 // END PURE
@@ -112,9 +132,11 @@ pub(crate) struct AncestorIndex {
     generation: u64,
     pos: HashMap<BlockIdentity, usize>,
     closure: Closure,
-    /// Creators with at least one pair of mutually incomparable blocks, i.e.
-    /// equivocators. For every other creator approval reduces to observation.
-    non_chain_creators: HashSet<NodeId>,
+    /// For every block that has an equivocating sibling (a block by the same
+    /// creator that is incomparable with it), those siblings. A creator that
+    /// forked once only appears here through the forked blocks, so the rest of
+    /// its history still reduces to observation.
+    conflicts: HashMap<usize, Vec<usize>>,
 }
 
 impl AncestorIndex {
@@ -168,19 +190,20 @@ impl AncestorIndex {
         for (i, &id) in ids.iter().enumerate() {
             by_creator.entry(&id.creator).or_default().push(i);
         }
-        let non_chain_creators = by_creator
-            .into_iter()
-            .filter(|(_, members)| members.len() > 1)
-            .filter_map(|(creator, mut members)| {
-                (!closure.is_chain(&mut members)).then(|| creator.clone())
-            })
-            .collect();
+        let mut conflicts: HashMap<usize, Vec<usize>> = HashMap::new();
+        for mut members in by_creator.into_values() {
+            // Honest creators form a chain, which is checked in O(k log k);
+            // only creators with incomparable blocks pay for the pairwise scan.
+            if members.len() > 1 && !closure.is_chain(&mut members) {
+                conflicts.extend(closure.incomparable_pairs(&members));
+            }
+        }
 
         Self {
             generation: blocklace.generation(),
             pos,
             closure,
-            non_chain_creators,
+            conflicts,
         }
     }
 
@@ -193,13 +216,18 @@ impl AncestorIndex {
         self.pos.get(id).copied()
     }
 
-    pub(crate) fn observes(&self, observer: usize, observed: usize) -> bool {
-        self.closure.observes(observer, observed)
-    }
-
-    /// True when all blocks of `creator` are pairwise comparable.
-    pub(crate) fn creator_is_chain(&self, creator: &NodeId) -> bool {
-        !self.non_chain_creators.contains(creator)
+    /// Definition 18: `observer` approves `target` when it observes `target`
+    /// and observes no other block by the same creator that is incomparable
+    /// with `target`.
+    pub(crate) fn approves(&self, observer: usize, target: usize) -> bool {
+        if !self.closure.observes(observer, target) {
+            return false;
+        }
+        self.conflicts.get(&target).is_none_or(|siblings| {
+            !siblings
+                .iter()
+                .any(|&sibling| self.closure.observes(observer, sibling))
+        })
     }
 }
 
@@ -302,6 +330,36 @@ mod tests {
                     .all(|&y| x == y || closure.observes(x, y) || closure.observes(y, x))
             });
             assert_eq!(closure.is_chain(&mut members), expected, "case {case}");
+        }
+    }
+
+    #[test]
+    fn incomparable_pairs_match_pairwise_check() {
+        let mut rng = Rng(0x0BAD_C0DE_1234_5678);
+        for case in 0..500 {
+            let n = 2 + rng.below(60) as usize;
+            let mut preds = vec![Vec::new(); n];
+            for (i, node_preds) in preds.iter_mut().enumerate().skip(1) {
+                for _ in 0..rng.below(3) {
+                    node_preds.push(rng.below(i as u64) as usize);
+                }
+            }
+            let stop: Vec<bool> = (0..n).map(|_| rng.below(15) == 0).collect();
+            let closure = Closure::build(&preds, &stop);
+            let members: Vec<usize> = (0..n).filter(|_| rng.below(2) == 0).collect();
+            let got: std::collections::HashMap<usize, Vec<usize>> =
+                closure.incomparable_pairs(&members).into_iter().collect();
+            for &a in &members {
+                let expected: Vec<usize> = members
+                    .iter()
+                    .copied()
+                    .filter(|&b| b != a && !closure.observes(a, b) && !closure.observes(b, a))
+                    .collect();
+                match got.get(&a) {
+                    Some(found) => assert_eq!(found, &expected, "case {case} a={a}"),
+                    None => assert!(expected.is_empty(), "case {case} a={a}"),
+                }
+            }
         }
     }
 

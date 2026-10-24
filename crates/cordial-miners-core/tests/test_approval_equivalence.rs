@@ -148,6 +148,35 @@ fn approves_matches_definition_with_equivocation() {
 }
 
 #[test]
+fn approves_matches_definition_after_a_single_fork() {
+    // Creator 1 forks once in round 2. Later rounds reference both fork blocks,
+    // so only the two forked blocks are incomparable. Every other block of
+    // creator 1 must still reduce to plain observation.
+    let mut blocklace = Blocklace::new();
+    let mut previous: Vec<Block> = Vec::new();
+    let mut tag = 0u16;
+    for round in 0..8 {
+        let predecessors: HashSet<BlockIdentity> =
+            previous.iter().map(|b| b.identity.clone()).collect();
+        let mut this_round = Vec::new();
+        for creator in 1..=4u8 {
+            let candidate = block(creator, tag, predecessors.clone());
+            tag += 1;
+            blocklace.insert(candidate.clone(), &MockVerifier).unwrap();
+            this_round.push(candidate);
+        }
+        if round == 2 {
+            let sibling = block(1, tag, predecessors.clone());
+            tag += 1;
+            blocklace.insert(sibling.clone(), &MockVerifier).unwrap();
+            this_round.push(sibling);
+        }
+        previous = this_round;
+    }
+    assert_equivalent(&blocklace, "single fork");
+}
+
+#[test]
 fn index_is_rebuilt_after_insert() {
     let mut blocklace = Blocklace::new();
     let genesis = block(1, 1, HashSet::new());
