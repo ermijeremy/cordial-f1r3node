@@ -113,13 +113,13 @@ fn make_block(creator: &NodeId, tag: u64, predecessors: HashSet<BlockIdentity>) 
     }
 }
 
-fn build_blocklace(waves: u64) -> Blocklace {
+fn build_blocklace(waves: u64, fork_round: Option<u64>) -> Blocklace {
     let validators: Vec<NodeId> = (0..VALIDATORS as u16).map(node).collect();
     let mut blocklace = Blocklace::new();
     let mut prev_round: Vec<Block> = Vec::new();
     let mut tag: u64 = 1;
 
-    for _ in 0..=(waves * WAVELENGTH) {
+    for round in 0..=(waves * WAVELENGTH) {
         let predecessors: HashSet<BlockIdentity> =
             prev_round.iter().map(|b| b.identity.clone()).collect();
         let mut this_round = Vec::new();
@@ -130,6 +130,17 @@ fn build_blocklace(waves: u64) -> Blocklace {
                 .insert(block.clone(), &MockVerifier)
                 .expect("bench block should insert");
             this_round.push(block);
+        }
+        if fork_round == Some(round) {
+            // Validator 0 equivocates once: a second block with the same
+            // predecessors but different content, so the two are incomparable.
+            // Later rounds reference both, so the fork is not extended.
+            let sibling = make_block(&validators[0], tag, predecessors.clone());
+            tag += 1;
+            blocklace
+                .insert(sibling.clone(), &MockVerifier)
+                .expect("fork block should insert");
+            this_round.push(sibling);
         }
         prev_round = this_round;
     }
@@ -144,8 +155,13 @@ fn main() {
     let bonds: HashMap<NodeId, u64> = (0..VALIDATORS as u16).map(|i| (node(i), 100)).collect();
     let leader = |wave: u64| Some(node((wave % VALIDATORS as u64) as u16));
 
+    let fork_round: Option<u64> = std::env::var("BENCH_FORK_ROUND")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let fork = fork_round.map_or_else(|| "none".to_string(), |round| round.to_string());
+
     let started = Instant::now();
-    let blocklace = build_blocklace(waves);
+    let blocklace = build_blocklace(waves, fork_round);
     let ingest = started.elapsed();
     let blocks = blocklace.dom().len();
     let heap_peak_ingest = PEAK.load(Relaxed);
@@ -161,7 +177,7 @@ fn main() {
     let heap_peak_order = PEAK.load(Relaxed);
 
     println!(
-        "waves={waves} heights={} blocks={blocks} output={} ingest_ms={} order_ms={} \
+        "waves={waves} fork_round={fork} heights={} blocks={blocks} output={} ingest_ms={} order_ms={} \
          heap_peak_ingest_mib={} heap_peak_order_mib={} rss_hwm_mib={}",
         waves * WAVELENGTH,
         output.len(),
