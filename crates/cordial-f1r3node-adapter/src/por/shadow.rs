@@ -1089,4 +1089,187 @@ mod tests {
         config.checkpoint_epoch_delay_waves = Some(0);
         assert!(validate_config(&config).is_err());
     }
+
+    // ---- long-history status publication (#263) --------------------------------
+    //
+    // These tests run the same sequence `run_shadow` runs after mirroring a node:
+    // publish the finalized output, build the `ShadowStatus`, write
+    // `shadow-status.json` atomically, and read it back. Only the gRPC fetch is
+    // replaced by a synthetic history.
+
+    use cordial_miners_core::BlockContent;
+
+    fn synthetic_block(creator: u16, tag: u64, predecessors: HashSet<BlockIdentity>) -> Block {
+        let creator = NodeId(creator.to_le_bytes().to_vec());
+        let mut content_hash = [0u8; 32];
+        content_hash[0..8].copy_from_slice(&tag.to_le_bytes());
+        content_hash[8..10].copy_from_slice(&creator.0);
+        Block {
+            identity: BlockIdentity {
+                content_hash,
+                creator,
+                signature: tag.to_le_bytes().to_vec(),
+            },
+            content: BlockContent {
+                payload: tag.to_le_bytes().to_vec(),
+                predecessors,
+            },
+        }
+    }
+
+    struct PublishedRun {
+        status: ShadowStatus,
+        mirrored: usize,
+        ingest: Duration,
+        publish: Duration,
+        status_write: Duration,
+        status_file_bytes: u64,
+    }
+
+    /// `fork_round` makes validator 0 equivocate once in that round.
+    fn publish_status_for_history(waves: u64, fork_round: Option<u64>) -> PublishedRun {
+        const VALIDATORS: u16 = 4;
+        let directory = tempfile::tempdir().unwrap();
+        let validators: Vec<u16> = (0..VALIDATORS).collect();
+        let bonds: HashMap<NodeId, u64> = validators
+            .iter()
+            .map(|validator| (NodeId(validator.to_le_bytes().to_vec()), 100))
+            .collect();
+        let por_config = PorConfig::default();
+        let ingress = LiveIngress::with_consensus_view(
+            PassthroughAdapter,
+            bonds.clone(),
+            CasperShardConf::default(),
+            "root",
+        );
+        let mut runtime = PorRuntime::open(
+            directory.path(),
+            initial_state(&bonds, &por_config),
+            ingress,
+            por_config,
+            b"root".to_vec(),
+            CORDIAL_WAVELENGTH,
+        )
+        .unwrap();
+
+        let ingest_started = std::time::Instant::now();
+        let mut previous_round: Vec<Block> = Vec::new();
+        let mut tag = 1u64;
+        let mut mirrored = 0usize;
+        for round in 0..=(waves * CORDIAL_WAVELENGTH) {
+            let predecessors: HashSet<BlockIdentity> = previous_round
+                .iter()
+                .map(|block| block.identity.clone())
+                .collect();
+            let mut creators = validators.clone();
+            if fork_round == Some(round) {
+                creators.push(0);
+            }
+            let mut this_round = Vec::with_capacity(creators.len());
+            for creator in creators {
+                let block = synthetic_block(creator, tag, predecessors.clone());
+                tag += 1;
+                runtime
+                    .ingress_mut()
+                    .ingest_trusted_block(block.clone())
+                    .unwrap();
+                mirrored += 1;
+                this_round.push(block);
+            }
+            previous_round = this_round;
+        }
+        let ingest = ingest_started.elapsed();
+        let head = (waves * CORDIAL_WAVELENGTH) as i64;
+
+        let publish_started = std::time::Instant::now();
+        let output = runtime.publish_finalized_output().unwrap();
+        let publish = publish_started.elapsed();
+
+        let status_started = std::time::Instant::now();
+        let status = ShadowStatus::from_runtime(&runtime, &output, None, head).unwrap();
+        let path = status_path(directory.path());
+        write_status(&path, &status).unwrap();
+        let published = read_status(&path).unwrap().expect("status file written");
+        published.validate_recovered(&status).unwrap();
+        assert_eq!(published, status);
+        let status_write = status_started.elapsed();
+        let status_file_bytes = std::fs::metadata(&path).unwrap().len();
+
+        PublishedRun {
+            status,
+            mirrored,
+            ingest,
+            publish,
+            status_write,
+            status_file_bytes,
+        }
+    }
+
+    fn assert_published(run: &PublishedRun) {
+        assert!(
+            run.status.finalized_anchor.is_some(),
+            "an anchor is expected"
+        );
+        assert!(
+            !run.status.finalized_hashes.is_empty(),
+            "finalized hashes expected"
+        );
+        assert!(run.status.observed_finalized_wave.is_some());
+        assert_eq!(run.status.mirrored_blocks, run.mirrored);
+        assert!(run.status_file_bytes > 0);
+    }
+
+    fn peak_rss_mib() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find(|line| line.starts_with("VmHWM:"))
+                    .and_then(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
+            })
+            .map_or(0, |kib| kib / 1024)
+    }
+
+    #[test]
+    fn status_is_published_on_a_short_history() {
+        assert_published(&publish_status_for_history(20, None));
+    }
+
+    #[test]
+    fn status_is_published_on_a_short_history_with_a_fork() {
+        assert_published(&publish_status_for_history(20, Some(5)));
+    }
+
+    /// Failed-run scale: about 3,200 heights and 12,800 blocks. Set
+    /// `LONG_HISTORY_WAVES` to change the size and `LONG_HISTORY_FORK_ROUND` to
+    /// make validator 0 equivocate once.
+    #[test]
+    #[ignore = "large history; run with --ignored --nocapture"]
+    fn status_is_published_at_failed_run_scale() {
+        let waves: u64 = std::env::var("LONG_HISTORY_WAVES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1067);
+        let fork_round: Option<u64> = std::env::var("LONG_HISTORY_FORK_ROUND")
+            .ok()
+            .and_then(|value| value.parse().ok());
+
+        let run = publish_status_for_history(waves, fork_round);
+
+        println!(
+            "waves={waves} fork_round={fork_round:?} heights={} mirrored_blocks={} \
+             finalized_hashes={} ingest_ms={} publish_ms={} status_write_ms={} \
+             status_file_bytes={} rss_hwm_mib={}",
+            waves * CORDIAL_WAVELENGTH,
+            run.mirrored,
+            run.status.finalized_hashes.len(),
+            run.ingest.as_millis(),
+            run.publish.as_millis(),
+            run.status_write.as_millis(),
+            run.status_file_bytes,
+            peak_rss_mib(),
+        );
+        assert_published(&run);
+    }
 }
