@@ -1,7 +1,7 @@
 //! Benchmark finalized-ordering poll paths as mirrored history grows.
 //!
 //! Run with:
-//! `cargo bench --locked -p cordial-f1r3node-adapter --bench por_ordering`
+//! `cargo bench --locked -p cordial-f1r3node-adapter --bench opt_ordering`
 //!
 //! Changed-poll samples time only the poll; fixture construction, baseline
 //! publication, and mirror growth happen in Criterion's untimed setup.
@@ -14,7 +14,7 @@ use cordial_f1r3node_adapter::live_ingress::LiveIngress;
 use cordial_f1r3node_adapter::shard_conf::CasperShardConf;
 use cordial_miners_core::Block;
 use cordial_miners_core::consensus::weighted_tau;
-use cordial_miners_core::crypto::hash_content;
+use cordial_miners_core::crypto::block_hash;
 use cordial_miners_core::execution::{BlockState, CordialBlockPayload};
 use cordial_miners_core::types::{BlockContent, BlockIdentity, NodeId};
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
@@ -43,6 +43,7 @@ fn bonds() -> HashMap<NodeId, u64> {
 fn make_block(creator: &NodeId, tag: u64, predecessors: &[BlockIdentity]) -> Block {
     let predecessors: HashSet<_> = predecessors.iter().cloned().collect();
     let payload = CordialBlockPayload {
+        por_authorizations: Vec::new(),
         state: BlockState {
             pre_state_hash: vec![0; 32],
             post_state_hash: vec![1; 32],
@@ -57,9 +58,10 @@ fn make_block(creator: &NodeId, tag: u64, predecessors: &[BlockIdentity]) -> Blo
         payload: payload.to_bytes(),
         predecessors,
     };
+    let content_hash = block_hash(creator, &content);
     Block {
         identity: BlockIdentity {
-            content_hash: hash_content(&content),
+            content_hash,
             creator: creator.clone(),
             signature: tag.to_le_bytes().to_vec(),
         },

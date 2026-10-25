@@ -60,7 +60,7 @@ name = "ordered_output"
 harness = false
 
 [[bench]]
-name = "por_ordering"
+name = "opt_ordering"
 harness = false
 
 [[bench]]
