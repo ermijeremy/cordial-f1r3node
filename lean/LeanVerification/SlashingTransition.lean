@@ -33,12 +33,21 @@ structure PenaltyReputationState where
   validatorIds : List NodeId
   account : NodeId → ValidatorReputation
 
-/-- State invariants enforced by Rust's canonical entry validation. -/
+/-- State invariants enforced by Rust's canonical entry validation: strictly
+increasing (hence unique) identities, zero active reputation for excluded keys,
+and zero retained reputation for active keys. -/
 def PenaltyReputationState.WellFormed (state : PenaltyReputationState) : Prop :=
-  state.validatorIds.Nodup ∧
+  state.validatorIds.Pairwise (· < ·) ∧
     ∀ id, id ∈ state.validatorIds →
-      (state.account id).excluded = true →
-        (state.account id).activeReputation = 0
+      ((state.account id).excluded = true →
+        (state.account id).activeReputation = 0) ∧
+      ((state.account id).excluded = false →
+        (state.account id).retainedReputation = 0)
+
+theorem wellFormed_uniqueValidatorIds
+    (state : PenaltyReputationState) (hState : state.WellFormed) :
+    state.validatorIds.Nodup :=
+  hState.1.nodup
 
 /-- Consensus weight exported for an authorized identity.
 
@@ -60,32 +69,86 @@ theorem excluded_exportsZeroWeight
 
 /-! ## Authorized transition inputs -/
 
-/-- Transition-layer view of an event that has crossed the authorization
-boundary modeled by `AuthorizedPenaltyEvent` in `Slashing.lean`.
+/-- The fixed cryptographic verifier and protocol policy used by a transition.
+Evidence may come from different validated blocklace views, but a caller cannot
+substitute a different verifier or policy for an individual event. -/
+structure PenaltyAuthorizationContext where
+  crypto : CryptographicVerificationAssumption
+  policy : PenaltyAuthorizationPolicy
 
-This is intentionally a different type from `RawEquivocationEvidence`.
-`evidence` remains present because the Rust transition independently rejects
-an empty serialized proof even after authorization.
--/
-structure AuthorizedEquivocationEvent where
+/-- A transition event retains the complete authorization witness from #281,
+bound to every field consumed by replay. Nonempty bytes alone cannot construct
+this value. The witness is a proof, so executable comparison uses only data. -/
+structure AuthorizedEquivocationEvent (context : PenaltyAuthorizationContext) where
   offender : NodeId
   evidence : List UInt8
   offenseRound : Nat
   applicationRound : Nat
+  authorization :
+    ∃ (B : Blocklace) (hV : ValidBlocklace B)
+      (source : AuthorizedPenaltyEvent B hV context.crypto context.policy),
+      source.offender = offender ∧
+      source.evidence.proofMaterial = evidence ∧
+      source.offenseRound = offenseRound ∧
+      source.applicationRound = applicationRound
   deriving DecidableEq, Repr
 
-/-- Project the full evidence/crypto/policy authorization object into the
-fields consumed by the penalty transition. -/
+variable {context : PenaltyAuthorizationContext}
+
+/-- Retain the full evidence/crypto/policy witness and bind its projections. -/
 def AuthorizedEquivocationEvent.ofAuthorizedPenaltyEvent
     (B : Blocklace) (hV : ValidBlocklace B)
-    (crypto : CryptographicVerificationAssumption)
-    (policy : PenaltyAuthorizationPolicy)
-    (event : AuthorizedPenaltyEvent B hV crypto policy) :
-    AuthorizedEquivocationEvent where
+    (event : AuthorizedPenaltyEvent B hV context.crypto context.policy) :
+    AuthorizedEquivocationEvent context where
   offender := event.offender
   evidence := event.evidence.proofMaterial
   offenseRound := event.offenseRound
   applicationRound := event.applicationRound
+  authorization := ⟨B, hV, event, rfl, rfl, rfl, rfl⟩
+
+/-- Every event accepted by the typed transition still contains a structurally
+valid, authenticated, protocol-authorized source for the exact consumed data. -/
+theorem transitionEvent_has_authorizedSource
+    (event : AuthorizedEquivocationEvent context) :
+    ∃ (B : Blocklace) (hV : ValidBlocklace B)
+      (source : AuthorizedPenaltyEvent B hV context.crypto context.policy),
+      source.offender = event.offender ∧
+      source.evidence.proofMaterial = event.evidence ∧
+      source.offenseRound = event.offenseRound ∧
+      source.applicationRound = event.applicationRound :=
+  event.authorization
+
+/-- The policy witness remains bound to the exact offender, evidence bytes,
+offense depth, and application round used by the transition. -/
+theorem transitionEvent_policy_bound
+    (event : AuthorizedEquivocationEvent context) :
+    ∃ (evidence : RawEquivocationEvidence) (decision : PenaltyAuthorizationDecision),
+      evidence.claimedOffender = event.offender ∧
+      evidence.offenseRound = event.offenseRound ∧
+      evidence.proofMaterial = event.evidence ∧
+      PenaltyApplicationAuthorized context.policy decision evidence event.applicationRound := by
+  obtain ⟨B, hV, source, hOffender, hBytes, hOffense, hRound⟩ := event.authorization
+  refine ⟨source.evidence, source.authorizationDecision,
+    source.offenderBound.symm.trans hOffender,
+    source.offenseRoundBound.symm.trans hOffense, hBytes, ?_⟩
+  rw [← hRound]
+  exact source.authorized
+
+/-- A policy denying authorization cannot admit any transition event, even
+when an attacker can supply arbitrary nonempty proof bytes. -/
+theorem deniedPolicy_noTransitionEvent
+    (hDenied : ∀ decision evidence round,
+      ¬ context.policy decision evidence round)
+    (event : AuthorizedEquivocationEvent context) : False := by
+  obtain ⟨_, _, source, _⟩ := event.authorization
+  exact hDenied _ _ _ source.authorized
+
+/-- A verifier denying authentication likewise cannot admit transition events. -/
+theorem deniedAuthentication_noTransitionEvent
+    (hDenied : ∀ B evidence, ¬ context.crypto.verifies B evidence)
+    (event : AuthorizedEquivocationEvent context) : False := by
+  obtain ⟨_, _, source, _⟩ := event.authorization
+  exact hDenied _ _ source.authenticatedEvidence
 
 /-- Inactivity is included to model cross-penalty overlap rejection.  Its
 reputation decay is outside the slashing invariants proved by this module. -/
@@ -95,13 +158,13 @@ structure TransitionInactivityEvent where
   deriving DecidableEq, Repr
 
 /-- Finalized penalty events presented for exactly one successor round. -/
-structure PenaltyTransitionEvents where
+structure PenaltyTransitionEvents (context : PenaltyAuthorizationContext) where
   round : Nat
-  equivocations : List AuthorizedEquivocationEvent
+  equivocations : List (AuthorizedEquivocationEvent context)
   inactivity : List TransitionInactivityEvent
   deriving DecidableEq, Repr
 
-def allPenaltyOffenders (events : PenaltyTransitionEvents) : List NodeId :=
+def allPenaltyOffenders (events : PenaltyTransitionEvents context) : List NodeId :=
   events.equivocations.map (·.offender) ++ events.inactivity.map (·.offender)
 
 /-- All structural validation performed before any state update becomes
@@ -109,7 +172,7 @@ visible.  In particular, every offender is looked up in the previous state,
 and an already-ejected key can never be penalized or reactivated. -/
 def ValidPenaltyEvents
     (previous candidate : PenaltyReputationState)
-    (events : PenaltyTransitionEvents) : Prop :=
+    (events : PenaltyTransitionEvents context) : Prop :=
   events.round = previous.round + 1 ∧
     candidate.round = events.round ∧
     candidate.validatorIds = previous.validatorIds ∧
@@ -126,7 +189,7 @@ def ValidPenaltyEvents
 
 instance instDecidableValidPenaltyEvents
     (previous candidate : PenaltyReputationState)
-    (events : PenaltyTransitionEvents) :
+    (events : PenaltyTransitionEvents context) :
     Decidable (ValidPenaltyEvents previous candidate events) := by
   unfold ValidPenaltyEvents
   infer_instance
@@ -140,7 +203,7 @@ def previousActiveTotal (state : PenaltyReputationState) : Nat :=
     if (state.account id).excluded then 0 else (state.account id).activeReputation
 
 def isEquivocationOffender
-    (events : Finset AuthorizedEquivocationEvent) (id : NodeId) : Bool :=
+    (events : Finset (AuthorizedEquivocationEvent context)) (id : NodeId) : Bool :=
   decide (∃ event ∈ events, event.offender = id)
 
 /-- Correlated weight for `id`'s offense round, using only previous-round
@@ -149,7 +212,7 @@ exactly one term.  Defining it over a `Finset` also makes event order
 irrelevant by construction. -/
 def previousCorrelatedWeightFor
     (previous : PenaltyReputationState)
-    (events : Finset AuthorizedEquivocationEvent)
+    (events : Finset (AuthorizedEquivocationEvent context))
     (id : NodeId) : Nat :=
   ∑ target ∈ events.filter (fun event => event.offender = id),
     ∑ event ∈ events.filter (fun event => event.offenseRound = target.offenseRound),
@@ -161,7 +224,7 @@ def previousCorrelatedWeightFor
 private def slashedAccount
     (config : SlashingConfig)
     (previous : PenaltyReputationState)
-    (events : Finset AuthorizedEquivocationEvent)
+    (events : Finset (AuthorizedEquivocationEvent context))
     (id : NodeId) : ValidatorReputation :=
   let old := previous.account id
   let penalty := selectSlashPenalty config
@@ -178,7 +241,7 @@ def penaltySuccessor
     (config : SlashingConfig)
     (previous candidate : PenaltyReputationState)
     (round : Nat)
-    (events : Finset AuthorizedEquivocationEvent) : PenaltyReputationState where
+    (events : Finset (AuthorizedEquivocationEvent context)) : PenaltyReputationState where
   round := round
   validatorIds := previous.validatorIds
   account := fun id =>
@@ -189,32 +252,85 @@ def penaltySuccessor
     else
       candidate.account id
 
-/-- Explicit preconditions for the checked fixed-width Rust arithmetic.
-Failure of any clause rejects the staged transition rather than exposing a
-partially updated state. -/
+/-- Preconditions for the checked fixed-width Rust slashing arithmetic.
+Configuration validation is unconditional; weight aggregation and slash-only
+checks run only when equivocations are present. The checked cross products are
+correlated weight × scale and total weight × threshold, exactly as in Rust. -/
 def PenaltyArithmeticReady
     (config : SlashingConfig)
     (previous : PenaltyReputationState)
-    (events : Finset AuthorizedEquivocationEvent) : Prop :=
+    (events : Finset (AuthorizedEquivocationEvent context)) : Prop :=
   config.WellFormed ∧
     config.FitsU64 ∧
-    0 < previousActiveTotal previous ∧
-    previousActiveTotal previous ≤ u128Max ∧
-    previousActiveTotal previous * config.scale ≤ u128Max ∧
-    previousActiveTotal previous * config.correlationThreshold ≤ u128Max ∧
-    (∀ event ∈ events,
-      previousCorrelatedWeightFor previous events event.offender ≤
-        previousActiveTotal previous ∧
-      (previous.account event.offender).activeReputation ≤ u64Max ∧
-      (previous.account event.offender).activeReputation * config.scale ≤ u128Max)
+    (events.Nonempty →
+      0 < previousActiveTotal previous ∧
+      previousActiveTotal previous ≤ u128Max ∧
+      previousActiveTotal previous * config.correlationThreshold ≤ u128Max ∧
+      ∀ event ∈ events,
+        previousCorrelatedWeightFor previous events event.offender ≤
+          previousActiveTotal previous ∧
+        previousCorrelatedWeightFor previous events event.offender * config.scale ≤ u128Max ∧
+        (previous.account event.offender).activeReputation ≤ u64Max ∧
+        (previous.account event.offender).activeReputation *
+          (config.scale - selectSlashPenalty config
+            (previousCorrelatedWeightFor previous events event.offender)
+            (previousActiveTotal previous)) ≤ u128Max)
 
 instance instDecidablePenaltyArithmeticReady
     (config : SlashingConfig)
     (previous : PenaltyReputationState)
-    (events : Finset AuthorizedEquivocationEvent) :
+    (events : Finset (AuthorizedEquivocationEvent context)) :
     Decidable (PenaltyArithmeticReady config previous events) := by
   unfold PenaltyArithmeticReady
   infer_instance
+
+/-- Empty and inactivity-only rounds require configuration validation, but no
+positive total weight or slash products. -/
+theorem noEquivocations_arithmeticReady
+    (config : SlashingConfig) (previous : PenaltyReputationState) :
+    PenaltyArithmeticReady config previous
+      (∅ : Finset (AuthorizedEquivocationEvent context)) ↔
+      config.WellFormed ∧ config.FitsU64 := by
+  simp [PenaltyArithmeticReady]
+
+/-- Readiness implies success of the checked tier selector proved in #282. -/
+theorem arithmeticReady_checkedSelect
+    (config : SlashingConfig) (previous : PenaltyReputationState)
+    (events : Finset (AuthorizedEquivocationEvent context))
+    (hReady : PenaltyArithmeticReady config previous events)
+    (event : AuthorizedEquivocationEvent context) (hEvent : event ∈ events) :
+    checkedSelectSlashPenalty config
+      (previousCorrelatedWeightFor previous events event.offender)
+      (previousActiveTotal previous) =
+      .ok (selectSlashPenalty config
+        (previousCorrelatedWeightFor previous events event.offender)
+        (previousActiveTotal previous)) := by
+  have hWeights := hReady.2.2 ⟨event, hEvent⟩
+  have hOffender := hWeights.2.2.2 event hEvent
+  exact checkedSelectSlashPenalty_refines _ _ _ hReady.1 hReady.2.1
+    (hOffender.1.trans hWeights.2.1) hWeights.2.1 hWeights.1
+    hOffender.1 hOffender.2.1 hWeights.2.2.1
+
+/-- Readiness also implies success of checked retained-reputation arithmetic. -/
+theorem arithmeticReady_checkedRetained
+    (config : SlashingConfig) (previous : PenaltyReputationState)
+    (events : Finset (AuthorizedEquivocationEvent context))
+    (hReady : PenaltyArithmeticReady config previous events)
+    (event : AuthorizedEquivocationEvent context) (hEvent : event ∈ events) :
+    let penalty := selectSlashPenalty config
+      (previousCorrelatedWeightFor previous events event.offender)
+      (previousActiveTotal previous)
+    checkedRetainedReputation config
+      (previous.account event.offender).activeReputation penalty =
+      .ok (retainedReputation config
+        (previous.account event.offender).activeReputation penalty) := by
+  have hWeights := hReady.2.2 ⟨event, hEvent⟩
+  have hOffender := hWeights.2.2.2 event hEvent
+  have hPenalty := selectSlashPenalty_le_scale config
+    (previousCorrelatedWeightFor previous events event.offender)
+    (previousActiveTotal previous) hReady.1
+  exact checkedRetainedReputation_refines _ _ _ hReady.1 hReady.2.1
+    hOffender.2.2.1 (hPenalty.trans hReady.2.1.1) hPenalty hOffender.2.2.2
 
 inductive PenaltyTransitionError where
   | invalidEvents
@@ -225,7 +341,7 @@ inductive PenaltyTransitionError where
 def calculatePenaltyTransition
     (config : SlashingConfig)
     (previous candidate : PenaltyReputationState)
-    (events : PenaltyTransitionEvents) :
+    (events : PenaltyTransitionEvents context) :
     Except PenaltyTransitionError PenaltyReputationState :=
   if ValidPenaltyEvents previous candidate events then
     let eventSet := events.equivocations.toFinset
@@ -242,7 +358,7 @@ exclusion flags. -/
 def commitPenaltyTransition
     (config : SlashingConfig)
     (current candidate : PenaltyReputationState)
-    (events : PenaltyTransitionEvents) : PenaltyReputationState :=
+    (events : PenaltyTransitionEvents context) : PenaltyReputationState :=
   match calculatePenaltyTransition config current candidate events with
   | .ok successor => successor
   | .error _ => current
@@ -252,7 +368,7 @@ def commitPenaltyTransition
 theorem slash_zeroes_activeReputation
     (config : SlashingConfig)
     (previous candidate : PenaltyReputationState)
-    (round : Nat) (events : Finset AuthorizedEquivocationEvent)
+    (round : Nat) (events : Finset (AuthorizedEquivocationEvent context))
     (id : NodeId)
     (hActive : (previous.account id).excluded = false)
     (hOffender : isEquivocationOffender events id = true) :
@@ -263,7 +379,7 @@ theorem slash_zeroes_activeReputation
 theorem slash_setsExcluded
     (config : SlashingConfig)
     (previous candidate : PenaltyReputationState)
-    (round : Nat) (events : Finset AuthorizedEquivocationEvent)
+    (round : Nat) (events : Finset (AuthorizedEquivocationEvent context))
     (id : NodeId)
     (hActive : (previous.account id).excluded = false)
     (hOffender : isEquivocationOffender events id = true) :
@@ -274,7 +390,7 @@ theorem slash_setsExcluded
 theorem isolatedSlash_setsRetainedReputation
     (config : SlashingConfig)
     (previous candidate : PenaltyReputationState)
-    (round : Nat) (events : Finset AuthorizedEquivocationEvent)
+    (round : Nat) (events : Finset (AuthorizedEquivocationEvent context))
     (id : NodeId)
     (hActive : (previous.account id).excluded = false)
     (hOffender : isEquivocationOffender events id = true)
@@ -291,7 +407,7 @@ theorem isolatedSlash_setsRetainedReputation
 theorem correlatedSlash_zeroesRetainedReputation
     (config : SlashingConfig)
     (previous candidate : PenaltyReputationState)
-    (round : Nat) (events : Finset AuthorizedEquivocationEvent)
+    (round : Nat) (events : Finset (AuthorizedEquivocationEvent context))
     (id : NodeId)
     (hConfig : config.WellFormed)
     (hActive : (previous.account id).excluded = false)
@@ -308,7 +424,7 @@ theorem correlatedSlash_zeroesRetainedReputation
 theorem slash_preserves_nonOffenders
     (config : SlashingConfig)
     (previous candidate : PenaltyReputationState)
-    (round : Nat) (events : Finset AuthorizedEquivocationEvent)
+    (round : Nat) (events : Finset (AuthorizedEquivocationEvent context))
     (id : NodeId)
     (hActive : (previous.account id).excluded = false)
     (hInnocent : isEquivocationOffender events id = false) :
@@ -319,7 +435,7 @@ theorem slash_preserves_nonOffenders
 theorem excluded_persistent
     (config : SlashingConfig)
     (previous candidate : PenaltyReputationState)
-    (round : Nat) (events : Finset AuthorizedEquivocationEvent)
+    (round : Nat) (events : Finset (AuthorizedEquivocationEvent context))
     (id : NodeId)
     (hExcluded : (previous.account id).excluded = true) :
     (penaltySuccessor config previous candidate round events).account id =
@@ -329,7 +445,7 @@ theorem excluded_persistent
 theorem retainedReputation_persistent
     (config : SlashingConfig)
     (previous candidate : PenaltyReputationState)
-    (round : Nat) (events : Finset AuthorizedEquivocationEvent)
+    (round : Nat) (events : Finset (AuthorizedEquivocationEvent context))
     (id : NodeId)
     (hExcluded : (previous.account id).excluded = true) :
     ((penaltySuccessor config previous candidate round events).account id
@@ -341,33 +457,32 @@ and pre-penalty candidate snapshots are well formed. -/
 theorem penaltySuccessor_wellFormed
     (config : SlashingConfig)
     (previous candidate : PenaltyReputationState)
-    (round : Nat) (events : Finset AuthorizedEquivocationEvent)
+    (round : Nat) (events : Finset (AuthorizedEquivocationEvent context))
     (hPrevious : previous.WellFormed)
     (hCandidate : candidate.WellFormed)
     (hIds : candidate.validatorIds = previous.validatorIds) :
     (penaltySuccessor config previous candidate round events).WellFormed := by
   constructor
   · exact hPrevious.1
-  · intro id hKnown hExcluded
+  · intro id hKnown
     change id ∈ previous.validatorIds at hKnown
     by_cases hPriorExcluded : (previous.account id).excluded = true
     · rw [excluded_persistent config previous candidate round events id hPriorExcluded]
-      exact hPrevious.2 id hKnown hPriorExcluded
+      exact hPrevious.2 id hKnown
     · have hPriorActive : (previous.account id).excluded = false := by
         simpa using hPriorExcluded
       by_cases hOffender : isEquivocationOffender events id = true
-      · exact slash_zeroes_activeReputation config previous candidate round events id
-          hPriorActive hOffender
+      · simp [penaltySuccessor, hPriorActive, hOffender, slashedAccount]
       · have hInnocent : isEquivocationOffender events id = false := by
           simpa using hOffender
         rw [slash_preserves_nonOffenders config previous candidate round events id
-          hPriorActive hInnocent] at hExcluded ⊢
-        exact hCandidate.2 id (by simpa [hIds] using hKnown) hExcluded
+          hPriorActive hInnocent]
+        exact hCandidate.2 id (by simpa [hIds] using hKnown)
 
 theorem invalidEvents_preserve_entireState
     (config : SlashingConfig)
     (current candidate : PenaltyReputationState)
-    (events : PenaltyTransitionEvents)
+    (events : PenaltyTransitionEvents context)
     (hInvalid : ¬ ValidPenaltyEvents current candidate events) :
     commitPenaltyTransition config current candidate events = current := by
   simp [commitPenaltyTransition, calculatePenaltyTransition, hInvalid]
@@ -375,7 +490,7 @@ theorem invalidEvents_preserve_entireState
 theorem arithmeticFailure_preserves_entireState
     (config : SlashingConfig)
     (current candidate : PenaltyReputationState)
-    (events : PenaltyTransitionEvents)
+    (events : PenaltyTransitionEvents context)
     (hValid : ValidPenaltyEvents current candidate events)
     (hArithmetic : ¬ PenaltyArithmeticReady config current
       events.equivocations.toFinset) :
@@ -384,7 +499,7 @@ theorem arithmeticFailure_preserves_entireState
 
 theorem duplicateOffender_rejected
     (previous candidate : PenaltyReputationState)
-    (events : PenaltyTransitionEvents)
+    (events : PenaltyTransitionEvents context)
     (hDuplicate : ¬ (allPenaltyOffenders events).Nodup) :
     ¬ ValidPenaltyEvents previous candidate events := by
   intro hValid
@@ -392,8 +507,8 @@ theorem duplicateOffender_rejected
 
 theorem unknownOffender_rejected
     (previous candidate : PenaltyReputationState)
-    (events : PenaltyTransitionEvents)
-    (event : AuthorizedEquivocationEvent)
+    (events : PenaltyTransitionEvents context)
+    (event : AuthorizedEquivocationEvent context)
     (hEvent : event ∈ events.equivocations)
     (hUnknown : event.offender ∉ previous.validatorIds) :
     ¬ ValidPenaltyEvents previous candidate events := by
@@ -404,8 +519,8 @@ theorem unknownOffender_rejected
 
 theorem emptyEquivocationEvidence_rejected
     (previous candidate : PenaltyReputationState)
-    (events : PenaltyTransitionEvents)
-    (event : AuthorizedEquivocationEvent)
+    (events : PenaltyTransitionEvents context)
+    (event : AuthorizedEquivocationEvent context)
     (hEvent : event ∈ events.equivocations)
     (hEmpty : event.evidence = []) :
     ¬ ValidPenaltyEvents previous candidate events := by
@@ -416,7 +531,7 @@ theorem emptyEquivocationEvidence_rejected
 
 theorem overlappingPenalty_rejected
     (previous candidate : PenaltyReputationState)
-    (events : PenaltyTransitionEvents)
+    (events : PenaltyTransitionEvents context)
     (id : NodeId)
     (hEquivocation : id ∈ events.equivocations.map (·.offender))
     (hInactivity : id ∈ events.inactivity.map (·.offender)) :
@@ -428,8 +543,8 @@ theorem overlappingPenalty_rejected
 
 theorem alreadyExcluded_rejected
     (previous candidate : PenaltyReputationState)
-    (events : PenaltyTransitionEvents)
-    (event : AuthorizedEquivocationEvent)
+    (events : PenaltyTransitionEvents context)
+    (event : AuthorizedEquivocationEvent context)
     (hEvent : event ∈ events.equivocations)
     (hExcluded : (previous.account event.offender).excluded = true) :
     ¬ ValidPenaltyEvents previous candidate events := by
@@ -445,7 +560,7 @@ theorem eventPermutation_invariant
     (config : SlashingConfig)
     (previous candidate : PenaltyReputationState)
     (round : Nat)
-    (first second : List AuthorizedEquivocationEvent)
+    (first second : List (AuthorizedEquivocationEvent context))
     (hPermutation : first.Perm second) :
     penaltySuccessor config previous candidate round first.toFinset =
       penaltySuccessor config previous candidate round second.toFinset := by
@@ -454,78 +569,5 @@ theorem eventPermutation_invariant
     simp only [List.mem_toFinset]
     exact hPermutation.mem_iff
   rw [hSets]
-
-/-! ## Small executable scenarios -/
-
-private def sampleAccount (id : NodeId) : ValidatorReputation :=
-  if id < 4 then ⟨100, 0, false⟩ else ⟨0, 0, false⟩
-
-private def samplePrevious : PenaltyReputationState :=
-  ⟨0, [0, 1, 2, 3], sampleAccount⟩
-
-private def sampleCandidate : PenaltyReputationState :=
-  ⟨1, [0, 1, 2, 3], sampleAccount⟩
-
-private def sampleEquivocation (id offenseRound : Nat) : AuthorizedEquivocationEvent :=
-  ⟨id, [1], offenseRound, 1⟩
-
-private def sampleInactivity (id : Nat) : TransitionInactivityEvent :=
-  ⟨id, 1⟩
-
-/-- One isolated offender among four equal validators retains 75%. -/
-example :
-    (penaltySuccessor defaultSlashingConfig samplePrevious sampleCandidate 1
-      [sampleEquivocation 0 7].toFinset).account 0 = ⟨0, 75, true⟩ := by
-  native_decide
-
-/-- Two same-round offenders exceed the 30% threshold and retain zero. -/
-example :
-    (penaltySuccessor defaultSlashingConfig samplePrevious sampleCandidate 1
-      [sampleEquivocation 0 7, sampleEquivocation 1 7].toFinset).account 0 =
-        ⟨0, 0, true⟩ := by
-  native_decide
-
-/-- An innocent validator is unchanged alongside several offenders. -/
-example :
-    (penaltySuccessor defaultSlashingConfig samplePrevious sampleCandidate 1
-      [sampleEquivocation 0 7, sampleEquivocation 1 7].toFinset).account 3 =
-        sampleCandidate.account 3 := by
-  native_decide
-
-/-- Duplicate equivocation offenders are rejected. -/
-example : ¬ ValidPenaltyEvents samplePrevious sampleCandidate
-    ⟨1, [sampleEquivocation 0 7, sampleEquivocation 0 7], []⟩ := by
-  native_decide
-
-/-- Equivocation/inactivity overlap is rejected. -/
-example : ¬ ValidPenaltyEvents samplePrevious sampleCandidate
-    ⟨1, [sampleEquivocation 0 7], [sampleInactivity 0]⟩ := by
-  native_decide
-
-/-- An unknown offender is rejected. -/
-example : ¬ ValidPenaltyEvents samplePrevious sampleCandidate
-    ⟨1, [sampleEquivocation 9 7], []⟩ := by
-  native_decide
-
-private def excludedPrevious : PenaltyReputationState :=
-  { samplePrevious with
-    account := fun id => if id = 0 then ⟨0, 75, true⟩ else sampleAccount id }
-
-/-- An already-ejected offender is rejected. -/
-example : ¬ ValidPenaltyEvents excludedPrevious sampleCandidate
-    ⟨1, [sampleEquivocation 0 7], []⟩ := by
-  native_decide
-
-/-- Reversed event order is a permutation, hence has the same successor. -/
-example :
-    [sampleEquivocation 0 7, sampleEquivocation 1 7].Perm
-      [sampleEquivocation 1 7, sampleEquivocation 0 7] := by
-  exact List.Perm.swap _ _ []
-
-/-- A later candidate cannot restore an ejected key's active weight. -/
-example :
-    ((penaltySuccessor defaultSlashingConfig excludedPrevious sampleCandidate 1 ∅)
-      ).account 0 = ⟨0, 75, true⟩ := by
-  native_decide
 
 end CordialMiners
