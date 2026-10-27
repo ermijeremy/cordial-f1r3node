@@ -22,7 +22,7 @@ use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_ma
 const WAVELENGTH: u64 = 3;
 const VALIDATOR_COUNT: u8 = 4;
 // Each wave adds WAVELENGTH rounds, each with one block per validator.
-const DEFAULT_HISTORY_WAVES: &[u64] = &[1, 10, 50, 100, 250, 500];
+const DEFAULT_HISTORY_WAVES: &[u64] = &[1, 10, 25, 50, 100, 250];
 
 #[derive(Default)]
 struct BenchAdapter;
@@ -178,7 +178,7 @@ fn bench_live_ingress_ordering(c: &mut Criterion) {
         // each history size without including fixture setup in measurements.
         let mut group = c.benchmark_group(format!("opt_ordering/live_poll/waves_{waves}"));
         group.sample_size(10);
-        group.measurement_time(Duration::from_secs(1));
+        group.measurement_time(Duration::from_secs(1 + waves / 50));
         group.warm_up_time(Duration::from_millis(500));
 
         // Validate expected path selection once per size; timed iterations
