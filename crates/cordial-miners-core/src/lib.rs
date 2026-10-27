@@ -1,3 +1,5 @@
+mod ancestor_index;
+
 /// Shared benchmark fixtures, excluded unless explicitly enabled.
 #[cfg(feature = "bench-support")]
 #[doc(hidden)]

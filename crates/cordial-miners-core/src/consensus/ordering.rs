@@ -26,8 +26,6 @@ pub struct OrderingCache {
     /// generation, a size change still invalidates the cache, so this can only
     /// be stricter than the size-based check it replaces — never looser.
     cache_generation: (u64, usize),
-    approved_blocks_by_leader: HashMap<BlockIdentity, HashSet<Block>>,
-    sorted_approved_by_leader: HashMap<BlockIdentity, Result<Vec<BlockIdentity>, OrderingError>>,
     previous_final_by_leader: HashMap<PreviousLeaderCacheKey, Option<BlockIdentity>>,
     weighted_previous_final_by_leader:
         HashMap<WeightedPreviousLeaderCacheKey, Option<BlockIdentity>>,
@@ -242,9 +240,7 @@ impl OrderingCache {
     /// populated at all, and lets tests distinguish "invalidation works" from
     /// "caching was silently disabled".
     pub fn cached_entries(&self) -> usize {
-        self.approved_blocks_by_leader.len()
-            + self.sorted_approved_by_leader.len()
-            + self.previous_final_by_leader.len()
+        self.previous_final_by_leader.len()
             + self.weighted_previous_final_by_leader.len()
             + self.tau_output_by_latest_leader.len()
             + self.weighted_tau_output_by_latest_leader.len()
@@ -260,31 +256,11 @@ fn sync_cache_generation(blocklace: &Blocklace, cache: &mut OrderingCache) {
     let generation = (blocklace.generation(), blocklace.dom().len());
     if cache.cache_generation != generation {
         cache.cache_generation = generation;
-        cache.approved_blocks_by_leader.clear();
-        cache.sorted_approved_by_leader.clear();
         cache.previous_final_by_leader.clear();
         cache.weighted_previous_final_by_leader.clear();
         cache.tau_output_by_latest_leader.clear();
         cache.weighted_tau_output_by_latest_leader.clear();
     }
-}
-
-fn approved_blocks_for_leader_cached(
-    blocklace: &Blocklace,
-    leader: &BlockIdentity,
-    cache: &mut OrderingCache,
-) -> HashSet<Block> {
-    sync_cache_generation(blocklace, cache);
-
-    if let Some(blocks) = cache.approved_blocks_by_leader.get(leader) {
-        return blocks.clone();
-    }
-
-    let blocks = approved_blocks_for_leader(blocklace, leader);
-    cache
-        .approved_blocks_by_leader
-        .insert(leader.clone(), blocks.clone());
-    blocks
 }
 
 fn sorted_approved_fragment(
@@ -294,16 +270,14 @@ fn sorted_approved_fragment(
 ) -> Result<Vec<BlockIdentity>, OrderingError> {
     sync_cache_generation(blocklace, cache);
 
-    if let Some(sorted) = cache.sorted_approved_by_leader.get(leader) {
-        return sorted.clone();
-    }
-
-    let approved = approved_blocks_for_leader_cached(blocklace, leader, cache);
-    let sorted = xsort(&approved);
-    cache
-        .sorted_approved_by_leader
-        .insert(leader.clone(), sorted.clone());
-    sorted
+    // Nothing is retained per leader (#263). Each leader's fragment is
+    // requested once per ordering call, and the cache is cleared whenever the
+    // blocklace changes, so a stored sorted list was never read back. Keeping
+    // one per leader cost O(leaders x blocks) identities (about 570 MiB of the
+    // 590 MiB heap peak at 12,800 blocks) and the approved set it is built from
+    // holds full `Block` clones, so both are dropped as soon as the sort is done.
+    let approved = approved_blocks_for_leader(blocklace, leader);
+    xsort(&approved)
 }
 
 fn previous_final_leader_cached<F>(
@@ -584,9 +558,10 @@ where
 
 /// Cached variant of [`tau`].
 ///
-/// Reuses per-leader approved block sets and sorted fragments across repeated
-/// calls. Cache entries are invalidated automatically when the blocklace size
-/// changes.
+/// Reuses previous-final-leader lookups and full ordered outputs across
+/// repeated calls. Per-leader approved sets and sorted fragments are recomputed
+/// rather than retained, which keeps memory linear in the history. Cache
+/// entries are invalidated automatically when the blocklace changes.
 pub fn tau_with_cache<F>(
     blocklace: &Blocklace,
     wavelength: u64,
@@ -870,9 +845,10 @@ where
 
 /// Cached variant of [`weighted_tau`].
 ///
-/// Reuses per-leader approved block sets and sorted fragments across repeated
-/// calls. Cache entries are invalidated automatically when the blocklace size
-/// changes.
+/// Reuses previous-final-leader lookups and full ordered outputs across
+/// repeated calls. Per-leader approved sets and sorted fragments are recomputed
+/// rather than retained, which keeps memory linear in the history. Cache
+/// entries are invalidated automatically when the blocklace changes.
 pub fn weighted_tau_with_cache<F>(
     blocklace: &Blocklace,
     wavelength: u64,
