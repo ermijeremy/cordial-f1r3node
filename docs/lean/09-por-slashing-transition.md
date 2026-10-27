@@ -10,8 +10,12 @@ events to a Proof-of-Reputation snapshot. The model is in
 `ValidatorReputation` records active reputation, retained reputation, and the
 permanent-exclusion bit for one validator. `PenaltyReputationState` adds the
 round, the unique validator identities, and their accounts. Its
-`WellFormed` predicate requires unique identities and zero active reputation
-for every excluded key.
+`WellFormed` predicate requires strictly increasing identities (and therefore
+uniqueness), zero active reputation for every excluded key, and zero retained
+reputation for every active key. These are the invariants checked by Rust's
+`validate_reputation_entries`. `wellFormed_uniqueValidatorIds` exposes the
+uniqueness consequence, and `penaltySuccessor_wellFormed` preserves all three
+requirements.
 
 ```lean
 structure ValidatorReputation where
@@ -28,11 +32,20 @@ def PenaltyReputationState.WellFormed
     (state : PenaltyReputationState) : Prop
 ```
 
-`AuthorizedEquivocationEvent` is intentionally distinct from
-`RawEquivocationEvidence`. The `ofAuthorizedPenaltyEvent` projection accepts
-only the authorization-boundary value defined by the evidence model. The
-transition retains serialized evidence because Rust independently rejects an
-empty proof at this layer.
+`AuthorizedEquivocationEvent context` retains an authorization witness from
+`AuthorizedPenaltyEvent` in the evidence model. The context fixes the
+cryptographic verifier and protocol policy for the entire transition. Each
+witness contains a valid blocklace view and the original authorized event,
+with proofs binding its offender, evidence bytes, offense depth, and
+application round to the consumed fields. Constructing the event directly
+requires the same witness as using `ofAuthorizedPenaltyEvent`; nonempty bytes
+alone are insufficient. The transition still independently rejects empty
+serialized evidence, as Rust does.
+
+`transitionEvent_policy_bound` exposes the preserved policy authorization for
+the exact consumed fields. `deniedPolicy_noTransitionEvent` and
+`deniedAuthentication_noTransitionEvent` prove that events cannot be constructed
+when the fixed context denies authorization or authentication.
 
 `ValidPenaltyEvents` checks the successor round, stable validator identities,
 unique offenders, nonempty evidence, known and active offenders, one-round
@@ -47,6 +60,16 @@ It exposes the staged `penaltySuccessor` only after event validation and all
 fixed-width arithmetic preconditions pass. `commitPenaltyTransition` models
 the state-level atomic commit: either the complete successor is installed or
 the complete current state is returned unchanged.
+
+Configuration checks always run. The weight-total and slashing-product checks
+run only for a nonempty equivocation set, matching Rust's guarded slashing
+branch. In particular, empty and inactivity-only penalty rounds may advance
+over zero active weight. For a slash, the checked products are the correlated
+weight for the offense round multiplied by the scale, and the previous total
+multiplied by the correlation threshold. There is no total-times-scale check.
+The retained-balance bound checks the selected survival fraction.
+`arithmeticReady_checkedSelect` and `arithmeticReady_checkedRetained` connect
+these conditions to the checked-arithmetic results proved in issue #282.
 
 ## Safety theorems
 
@@ -71,15 +94,30 @@ the complete current state is returned unchanged.
 - `eventPermutation_invariant` proves that any permutation of the authorized
   equivocation list produces the identical complete successor state.
 
-The module also contains executable examples for the isolated and correlated
-tiers, preservation of an innocent validator, every required rejection case,
+The companion `SlashingTransitionExamples.lean` module contains executable
+examples for the isolated and correlated tiers, preservation of an innocent
+validator, every required rejection case,
 reversed event order, and an attempted later restoration of an ejected key.
+Its authorization fixtures prove actual same-creator, same-depth forks in
+valid blocklaces. The test context explicitly assumes successful external
+authentication and separately authorizes the application round; no additional
+axioms are introduced.
+
+Review regressions also cover zero-weight empty and inactivity-only rounds,
+zero-weight slash rejection, a valid maximum-u64 slash whose total-times-scale
+product would overflow, actual correlated-product overflow with atomic
+rejection, invalid configuration without equivocations, and rejection of
+unsorted/duplicate identities and inconsistent active/retained balances.
 
 ## Rust correspondence
 
 | Lean definition or theorem | Rust behavior justified |
 | --- | --- |
+| `PenaltyReputationState.WellFormed`, `penaltySuccessor_wellFormed` | `commitments::validate_reputation_entries` canonical ordering and exclusion/balance consistency |
+| `transitionEvent_has_authorizedSource`, `transitionEvent_policy_bound` | intact authorization checked by `event.validate_authorization` |
 | `ValidPenaltyEvents` | `transition::apply_reputation_penalties` pre-mutation validation |
+| `noEquivocations_arithmeticReady` | guarded slashing branch in `transition::apply_reputation_penalties` |
+| `arithmeticReady_checkedSelect`, `arithmeticReady_checkedRetained` | exact checked products and retained-balance calculation in `penalties.rs` |
 | `previousActiveTotal`, `previousCorrelatedWeightFor` | `transition::apply_reputation_penalties` previous-vector correlation aggregation |
 | `isolatedSlash_setsRetainedReputation` | `penalties::compute_slash_penalty_wide` and `apply_slash_to_reputation` base tier |
 | `correlatedSlash_zeroesRetainedReputation` | full tier in `compute_slash_penalty_wide` and `apply_slash_to_reputation` |
