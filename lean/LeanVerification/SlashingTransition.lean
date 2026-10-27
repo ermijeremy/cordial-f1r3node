@@ -44,6 +44,11 @@ def PenaltyReputationState.WellFormed (state : PenaltyReputationState) : Prop :=
       ((state.account id).excluded = false →
         (state.account id).retainedReputation = 0)
 
+instance instDecidableWellFormed (state : PenaltyReputationState) :
+    Decidable state.WellFormed := by
+  unfold PenaltyReputationState.WellFormed
+  infer_instance
+
 theorem wellFormed_uniqueValidatorIds
     (state : PenaltyReputationState) (hState : state.WellFormed) :
     state.validatorIds.Nodup :=
@@ -333,24 +338,29 @@ theorem arithmeticReady_checkedRetained
     hOffender.2.2.1 (hPenalty.trans hReady.2.1.1) hPenalty hOffender.2.2.2
 
 inductive PenaltyTransitionError where
+  | invalidState
   | invalidEvents
   | arithmeticFailure
   deriving DecidableEq, Repr
 
-/-- Validate and calculate without mutating the caller's current state. -/
+/-- Validate both state snapshots before event validation and calculation.
+No successor is exposed for a malformed previous or candidate snapshot. -/
 def calculatePenaltyTransition
     (config : SlashingConfig)
     (previous candidate : PenaltyReputationState)
     (events : PenaltyTransitionEvents context) :
     Except PenaltyTransitionError PenaltyReputationState :=
-  if ValidPenaltyEvents previous candidate events then
-    let eventSet := events.equivocations.toFinset
-    if PenaltyArithmeticReady config previous eventSet then
-      .ok (penaltySuccessor config previous candidate events.round eventSet)
+  if previous.WellFormed ∧ candidate.WellFormed then
+    if ValidPenaltyEvents previous candidate events then
+      let eventSet := events.equivocations.toFinset
+      if PenaltyArithmeticReady config previous eventSet then
+        .ok (penaltySuccessor config previous candidate events.round eventSet)
+      else
+        .error .arithmeticFailure
     else
-      .error .arithmeticFailure
+      .error .invalidEvents
   else
-    .error .invalidEvents
+    .error .invalidState
 
 /-- Atomic state-level commit.  Any validation or arithmetic error returns the
 entire prior state, including its round, validator set, retained balances, and
@@ -479,13 +489,70 @@ theorem penaltySuccessor_wellFormed
           hPriorActive hInnocent]
         exact hCandidate.2 id (by simpa [hIds] using hKnown)
 
+/-- A successful calculation establishes well-formedness itself; callers need
+no separate state-invariant hypotheses to use this result. -/
+theorem calculatePenaltyTransition_ok_wellFormed
+    (config : SlashingConfig)
+    (previous candidate successor : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context)
+    (hCalculated : calculatePenaltyTransition config previous candidate events =
+      .ok successor) :
+    successor.WellFormed := by
+  by_cases hStates : previous.WellFormed ∧ candidate.WellFormed
+  · by_cases hEvents : ValidPenaltyEvents previous candidate events
+    · by_cases hArithmetic : PenaltyArithmeticReady config previous events.equivocations.toFinset
+      · have hSuccessor :
+            penaltySuccessor config previous candidate events.round
+              events.equivocations.toFinset = successor := by
+          simpa [calculatePenaltyTransition, hStates, hEvents, hArithmetic] using hCalculated
+        rw [← hSuccessor]
+        exact penaltySuccessor_wellFormed config previous candidate events.round
+          events.equivocations.toFinset hStates.1 hStates.2 hEvents.2.2.1
+      · simp [calculatePenaltyTransition, hStates, hEvents, hArithmetic] at hCalculated
+    · simp [calculatePenaltyTransition, hStates, hEvents] at hCalculated
+  · simp [calculatePenaltyTransition, hStates] at hCalculated
+
+/-- Every committed state remains well formed if the current state is well
+formed, including when a malformed candidate is rejected. -/
+theorem commitPenaltyTransition_wellFormed
+    (config : SlashingConfig)
+    (current candidate : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context)
+    (hCurrent : current.WellFormed) :
+    (commitPenaltyTransition config current candidate events).WellFormed := by
+  cases hCalculated : calculatePenaltyTransition config current candidate events with
+  | ok successor =>
+    simpa [commitPenaltyTransition, hCalculated] using
+      calculatePenaltyTransition_ok_wellFormed config current candidate successor events hCalculated
+  | error error =>
+    simpa [commitPenaltyTransition, hCalculated] using hCurrent
+
+theorem invalidState_rejected
+    (config : SlashingConfig)
+    (previous candidate : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context)
+    (hInvalid : ¬ (previous.WellFormed ∧ candidate.WellFormed)) :
+    calculatePenaltyTransition config previous candidate events = .error .invalidState := by
+  simp [calculatePenaltyTransition, hInvalid]
+
+/-- Rejecting either input preserves the complete current state, even when
+that current state was itself malformed. Validation never partially repairs it. -/
+theorem invalidState_preserve_entireState
+    (config : SlashingConfig)
+    (current candidate : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context)
+    (hInvalid : ¬ (current.WellFormed ∧ candidate.WellFormed)) :
+    commitPenaltyTransition config current candidate events = current := by
+  simp [commitPenaltyTransition, invalidState_rejected config current candidate events hInvalid]
+
 theorem invalidEvents_preserve_entireState
     (config : SlashingConfig)
     (current candidate : PenaltyReputationState)
     (events : PenaltyTransitionEvents context)
     (hInvalid : ¬ ValidPenaltyEvents current candidate events) :
     commitPenaltyTransition config current candidate events = current := by
-  simp [commitPenaltyTransition, calculatePenaltyTransition, hInvalid]
+  by_cases hStates : current.WellFormed ∧ candidate.WellFormed <;>
+    simp [commitPenaltyTransition, calculatePenaltyTransition, hStates, hInvalid]
 
 theorem arithmeticFailure_preserves_entireState
     (config : SlashingConfig)
@@ -495,7 +562,8 @@ theorem arithmeticFailure_preserves_entireState
     (hArithmetic : ¬ PenaltyArithmeticReady config current
       events.equivocations.toFinset) :
     commitPenaltyTransition config current candidate events = current := by
-  simp [commitPenaltyTransition, calculatePenaltyTransition, hValid, hArithmetic]
+  by_cases hStates : current.WellFormed ∧ candidate.WellFormed <;>
+    simp [commitPenaltyTransition, calculatePenaltyTransition, hStates, hValid, hArithmetic]
 
 theorem duplicateOffender_rejected
     (previous candidate : PenaltyReputationState)

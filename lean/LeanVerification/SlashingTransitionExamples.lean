@@ -296,5 +296,65 @@ example : ¬ (⟨0, [0], fun _ => ⟨100, 75, false⟩⟩ : PenaltyReputationSta
 example : ¬ (⟨0, [0], fun _ => ⟨100, 75, true⟩⟩ : PenaltyReputationState).WellFormed := by
   simp [PenaltyReputationState.WellFormed]
 
+/-! ## State validation at the executable transition boundary -/
+
+private def emptyEvents : PenaltyTransitionEvents sampleContext := ⟨1, [], []⟩
+
+private def malformedStates : List PenaltyReputationState :=
+  [{ samplePrevious with validatorIds := [1, 0] },
+   { samplePrevious with validatorIds := [0, 0] },
+   { samplePrevious with account := fun _ => ⟨100, 75, false⟩ },
+   { samplePrevious with account := fun _ => ⟨100, 75, true⟩ }]
+
+private def rejectsInvalidState
+    (previous candidate : PenaltyReputationState) : Bool :=
+  match calculatePenaltyTransition defaultSlashingConfig previous candidate emptyEvents with
+  | .error .invalidState => true
+  | _ => false
+
+/-- Malformed previous snapshots are rejected even when both snapshots share
+the same identities and all empty-event checks would otherwise pass. -/
+example : malformedStates.all (fun previous =>
+    rejectsInvalidState previous { previous with round := 1 }) = true := by
+  native_decide
+
+/-- Validate previous snapshots independently of a well-formed candidate. -/
+example : malformedStates.all (fun previous =>
+    rejectsInvalidState previous sampleCandidate) = true := by
+  native_decide
+
+/-- Validate candidate snapshots independently of a well-formed previous state. -/
+example : malformedStates.all (fun candidate =>
+    rejectsInvalidState samplePrevious { candidate with round := 1 }) = true := by
+  native_decide
+
+private def retainedActiveCandidate : PenaltyReputationState :=
+  { sampleCandidate with account := fun _ => ⟨100, 75, false⟩ }
+
+/-- This is the review's counterexample: event validation and arithmetic alone
+accept it, but state validation must reject its active retained balance. -/
+example : ValidPenaltyEvents samplePrevious retainedActiveCandidate emptyEvents := by
+  native_decide
+
+example : PenaltyArithmeticReady defaultSlashingConfig samplePrevious
+    (∅ : Finset (AuthorizedEquivocationEvent sampleContext)) := by
+  native_decide
+
+example : rejectsInvalidState samplePrevious retainedActiveCandidate = true := by
+  native_decide
+
+/-- The entire valid current state survives rejection of that candidate. -/
+example : commitPenaltyTransition defaultSlashingConfig samplePrevious
+    retainedActiveCandidate emptyEvents = samplePrevious := by
+  apply invalidState_preserve_entireState
+  native_decide
+
+/-- A malformed current state is also returned intact on rejection. -/
+example : commitPenaltyTransition defaultSlashingConfig
+    { retainedActiveCandidate with round := 0 } sampleCandidate emptyEvents =
+      { retainedActiveCandidate with round := 0 } := by
+  apply invalidState_preserve_entireState
+  native_decide
+
 end CordialMiners.SlashingTransitionExamples
 

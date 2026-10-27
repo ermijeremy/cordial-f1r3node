@@ -56,12 +56,15 @@ snapshot. Therefore neither blended candidate weights nor event order can
 affect correlation-tier selection.
 
 `calculatePenaltyTransition` returns `Except PenaltyTransitionError State`.
-It exposes the staged `penaltySuccessor` only after event validation and all
+It first checks that both the previous and candidate snapshots are well formed,
+returning `invalidState` if either is malformed. It exposes the staged
+`penaltySuccessor` only after state validation, event validation, and all
 fixed-width arithmetic preconditions pass. `commitPenaltyTransition` models
 the state-level atomic commit: either the complete successor is installed or
 the complete current state is returned unchanged.
 
-Configuration checks always run. The weight-total and slashing-product checks
+After state and event validation, configuration checks run even without
+equivocations. The weight-total and slashing-product checks
 run only for a nonempty equivocation set, matching Rust's guarded slashing
 branch. In particular, empty and inactivity-only penalty rounds may advance
 over zero active weight. For a slash, the checked products are the correlated
@@ -85,6 +88,12 @@ these conditions to the checked-arithmetic results proved in issue #282.
   candidates cannot resurrect an excluded key or replace its retained balance.
 - `penaltySuccessor_wellFormed` proves that a transition preserves the state
   representation invariants.
+- `calculatePenaltyTransition_ok_wellFormed` proves that every successful
+  calculation returns a well-formed successor, without separate caller
+  assumptions about its inputs. `commitPenaltyTransition_wellFormed` preserves
+  a well-formed current state even when the candidate is malformed.
+- `invalidState_rejected` and `invalidState_preserve_entireState` prove that
+  either malformed input is rejected while preserving the entire current state.
 - `invalidEvents_preserve_entireState` and
   `arithmeticFailure_preserves_entireState` cover the complete state rather
   than a single account field.
@@ -108,12 +117,18 @@ zero-weight slash rejection, a valid maximum-u64 slash whose total-times-scale
 product would overflow, actual correlated-product overflow with atomic
 rejection, invalid configuration without equivocations, and rejection of
 unsorted/duplicate identities and inconsistent active/retained balances.
+The state-validation regressions exercise the executable transition with each
+malformed previous or candidate snapshot, including the empty-event candidate
+whose event and arithmetic checks both pass. They also establish complete-state
+equality after rejection of a malformed previous or candidate snapshot.
 
 ## Rust correspondence
 
 | Lean definition or theorem | Rust behavior justified |
 | --- | --- |
 | `PenaltyReputationState.WellFormed`, `penaltySuccessor_wellFormed` | `commitments::validate_reputation_entries` canonical ordering and exclusion/balance consistency |
+| `calculatePenaltyTransition_ok_wellFormed`, `invalidState_rejected` | previous-vector validation in `audit::replay_reputation_transition_with_penalties` and structurally valid pipeline candidates |
+| `commitPenaltyTransition_wellFormed`, `invalidState_preserve_entireState` | fail-closed state admission and atomic audited commit |
 | `transitionEvent_has_authorizedSource`, `transitionEvent_policy_bound` | intact authorization checked by `event.validate_authorization` |
 | `ValidPenaltyEvents` | `transition::apply_reputation_penalties` pre-mutation validation |
 | `noEquivocations_arithmeticReady` | guarded slashing branch in `transition::apply_reputation_penalties` |
