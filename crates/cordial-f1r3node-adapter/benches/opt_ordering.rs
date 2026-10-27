@@ -21,7 +21,8 @@ use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_ma
 
 const WAVELENGTH: u64 = 3;
 const VALIDATOR_COUNT: u8 = 4;
-const HISTORY_WAVES: &[u64] = &[1, 4, 10];
+// Each wave adds WAVELENGTH rounds, each with one block per validator.
+const DEFAULT_HISTORY_WAVES: &[u64] = &[1, 10, 50, 100, 250, 500];
 
 #[derive(Default)]
 struct BenchAdapter;
@@ -38,6 +39,29 @@ fn node(id: u8) -> NodeId {
 
 fn bonds() -> HashMap<NodeId, u64> {
     (0..VALIDATOR_COUNT).map(|id| (node(id), 100)).collect()
+}
+
+fn history_waves() -> Vec<u64> {
+    match std::env::var("OPT_ORDERING_WAVES") {
+        Ok(value) => {
+            let waves: Vec<_> = value
+                .split(',')
+                .map(|value| {
+                    value
+                        .trim()
+                        .parse()
+                        .unwrap_or_else(|error| panic!("invalid OPT_ORDERING_WAVES value: {error}"))
+                })
+                .collect();
+            assert!(
+                !waves.is_empty(),
+                "OPT_ORDERING_WAVES must contain at least one wave count"
+            );
+            waves
+        }
+        Err(std::env::VarError::NotPresent) => DEFAULT_HISTORY_WAVES.to_vec(),
+        Err(error) => panic!("cannot read OPT_ORDERING_WAVES: {error}"),
+    }
 }
 
 fn make_block(creator: &NodeId, tag: u64, predecessors: &[BlockIdentity]) -> Block {
@@ -74,6 +98,8 @@ fn append_round(
     previous_round: &[BlockIdentity],
     tag: &mut u64,
 ) -> Vec<BlockIdentity> {
+    // Blocks in a round share the previous round as predecessors; the returned
+    // identities become the predecessor set for the next round.
     let mut current_round = Vec::with_capacity(usize::from(VALIDATOR_COUNT));
     for validator in 0..VALIDATOR_COUNT {
         let block = make_block(&node(validator), *tag, previous_round);
@@ -91,10 +117,12 @@ fn build_ingress(waves: u64) -> (LiveIngress<BenchAdapter>, Vec<BlockIdentity>, 
         BenchAdapter,
         bonds(),
         CasperShardConf::default(),
-        "por-ordering-bench",
+        "opt-ordering-bench",
     );
     let mut previous_round = Vec::new();
     let mut tag = 1;
+    // Include round zero, so the fixture contains one more round than the
+    // requested number of waves.
     for _ in 0..=(waves * WAVELENGTH) {
         previous_round = append_round(&mut ingress, &previous_round, &mut tag);
     }
@@ -107,6 +135,7 @@ fn grow_mirror(
     first_round: u64,
     tag: &mut u64,
 ) {
+    // Add exactly one wave after the baseline output has been published.
     let mut previous = previous_round;
     for _ in first_round..first_round + WAVELENGTH {
         previous = append_round(ingress, &previous, tag);
@@ -114,6 +143,8 @@ fn grow_mirror(
 }
 
 fn independent_full_output(ingress: &LiveIngress<BenchAdapter>) -> Vec<BlockIdentity> {
+    // Use standalone weighted tau as the correctness oracle for both changed
+    // mirror paths rather than comparing one optimized path to the other.
     let mut validators: Vec<_> = ingress.bonds().keys().cloned().collect();
     validators.sort();
     let leader_count = validators.len();
@@ -142,13 +173,18 @@ fn report_diagnostics(label: &str, history_blocks: usize, ingress: &LiveIngress<
 }
 
 fn bench_live_ingress_ordering(c: &mut Criterion) {
-    let mut group = c.benchmark_group("por_ordering/live_poll");
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(1));
-    group.warm_up_time(Duration::from_millis(500));
+    for waves in history_waves() {
+        // Separate groups allow Criterion to reset timing configuration for
+        // each history size without including fixture setup in measurements.
+        let mut group = c.benchmark_group(format!("opt_ordering/live_poll/waves_{waves}"));
+        group.sample_size(10);
+        group.measurement_time(Duration::from_secs(1));
+        group.warm_up_time(Duration::from_millis(500));
 
-    for &waves in HISTORY_WAVES {
+        // Validate expected path selection once per size; timed iterations
+        // below reproduce that state using Criterion's untimed setup closure.
         let (mut unchanged_ingress, _, _) = build_ingress(waves);
+        let unchanged_blocks = unchanged_ingress.blocklace().dom().len();
         let unchanged_output = unchanged_ingress
             .latest_finalized_ordered_output(WAVELENGTH)
             .expect("baseline ordering should succeed");
@@ -166,9 +202,12 @@ fn bench_live_ingress_ordering(c: &mut Criterion) {
             &unchanged_ingress,
         );
         group.bench_with_input(
-            BenchmarkId::new("unchanged", format!("waves_{waves}")),
-            &waves,
-            |b, &waves| {
+            BenchmarkId::new(
+                "unchanged",
+                format!("waves_{waves}_blocks_{unchanged_blocks}"),
+            ),
+            &(waves, unchanged_blocks),
+            |b, &(waves, _)| {
                 b.iter_batched(
                     || {
                         let (mut ingress, _, _) = build_ingress(waves);
@@ -177,6 +216,8 @@ fn bench_live_ingress_ordering(c: &mut Criterion) {
                             .expect("baseline ordering should succeed");
                         ingress
                     },
+                    // This closure alone is timed: the mirror and prior output
+                    // are already prepared by the setup closure.
                     |mut ingress| {
                         black_box(
                             ingress
@@ -189,6 +230,8 @@ fn bench_live_ingress_ordering(c: &mut Criterion) {
             },
         );
 
+        // An unchanged weight snapshot and a strict one-wave append should
+        // allow the saved finalized prefix to be extended.
         let (mut incremental_check, previous_round, mut tag) = build_ingress(waves);
         let _ = incremental_check
             .latest_finalized_ordered_output(WAVELENGTH)
@@ -203,6 +246,7 @@ fn bench_live_ingress_ordering(c: &mut Criterion) {
         let extended_output = incremental_check
             .latest_finalized_ordered_output(WAVELENGTH)
             .expect("changed-mirror ordering should succeed");
+        let extended_blocks = incremental_check.blocklace().dom().len();
         assert_eq!(
             extended_output.blocks,
             independent_full_output(&incremental_check)
@@ -218,9 +262,12 @@ fn bench_live_ingress_ordering(c: &mut Criterion) {
             &incremental_check,
         );
         group.bench_with_input(
-            BenchmarkId::new("changed_verified_prefix", format!("waves_{waves}")),
-            &waves,
-            |b, &waves| {
+            BenchmarkId::new(
+                "changed_verified_prefix",
+                format!("waves_{waves}_blocks_{extended_blocks}"),
+            ),
+            &(waves, extended_blocks),
+            |b, &(waves, _)| {
                 b.iter_batched(
                     || {
                         let (mut ingress, previous_round, mut tag) = build_ingress(waves);
@@ -247,6 +294,8 @@ fn bench_live_ingress_ordering(c: &mut Criterion) {
             },
         );
 
+        // Changing weights and restoring them invalidates the saved reuse
+        // state while leaving the final ordering configuration unchanged.
         let (mut full_check, previous_round, mut tag) = build_ingress(waves);
         let _ = full_check
             .latest_finalized_ordered_output(WAVELENGTH)
@@ -264,6 +313,7 @@ fn bench_live_ingress_ordering(c: &mut Criterion) {
         let full_output = full_check
             .latest_finalized_ordered_output(WAVELENGTH)
             .expect("full fallback ordering should succeed");
+        let fallback_blocks = full_check.blocklace().dom().len();
         assert_eq!(full_output.blocks, independent_full_output(&full_check));
         assert_eq!(full_check.ordering_diagnostics().last_path, Some("full"));
         report_diagnostics(
@@ -272,9 +322,12 @@ fn bench_live_ingress_ordering(c: &mut Criterion) {
             &full_check,
         );
         group.bench_with_input(
-            BenchmarkId::new("changed_full_fallback", format!("waves_{waves}")),
-            &waves,
-            |b, &waves| {
+            BenchmarkId::new(
+                "changed_full_fallback",
+                format!("waves_{waves}_blocks_{fallback_blocks}"),
+            ),
+            &(waves, fallback_blocks),
+            |b, &(waves, _)| {
                 b.iter_batched(
                     || {
                         let (mut ingress, previous_round, mut tag) = build_ingress(waves);
@@ -304,8 +357,8 @@ fn bench_live_ingress_ordering(c: &mut Criterion) {
                 );
             },
         );
+        group.finish();
     }
-    group.finish();
 }
 
 criterion_group!(benches, bench_live_ingress_ordering);
