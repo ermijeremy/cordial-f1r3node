@@ -9,6 +9,8 @@ import LeanVerification.Observe
 import LeanVerification.Equivocation
 import LeanVerification.Slashing
 import LeanVerification.SlashingArithmetic
+import LeanVerification.SlashingTransition
+import LeanVerification.SlashingTransitionExamples
 import LeanVerification.Approval
 import LeanVerification.Finality
 import LeanVerification.Ordering
