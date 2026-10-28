@@ -30,6 +30,8 @@ pub struct Blocklace {
     pub(crate) checkpoint_weighted_order_prefix: Vec<BlockIdentity>,
     /// Monotonic counter over structural mutations. See [`Blocklace::generation`].
     generation: u64,
+    /// Stable identity for this in-memory mirror, distinct across reconstruction.
+    cache_identity: Arc<()>,
     /// Lazily built ancestor bit matrix, stamped with the generation it was
     /// built at. It is rebuilt whenever the stamp no longer matches, so a
     /// mutation path that forgot to clear it can never yield a stale answer.
@@ -47,6 +49,7 @@ impl Blocklace {
             checkpoint_order_prefix: Vec::new(),
             checkpoint_weighted_order_prefix: Vec::new(),
             generation: 0,
+            cache_identity: Arc::new(()),
             ancestor_index: Mutex::new(None),
         }
     }
@@ -67,6 +70,10 @@ impl Blocklace {
     /// distinguish from no change at all.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub(crate) fn cache_identity(&self) -> &Arc<()> {
+        &self.cache_identity
     }
 
     /// Ancestor index for the current generation, built on first use.

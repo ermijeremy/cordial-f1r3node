@@ -65,6 +65,10 @@ name = "ordered_output"
 harness = false
 
 [[bench]]
+name = "opt_ordering"
+harness = false
+
+[[bench]]
 name = "block_translation"
 harness = false
 
