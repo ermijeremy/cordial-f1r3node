@@ -74,6 +74,8 @@ impl Blocklace {
 
     pub(crate) fn cache_identity(&self) -> &Arc<()> {
         &self.cache_identity
+    }
+
     /// Ancestor index for the current generation, built on first use.
     ///
     /// Costs O(N^2 / 64) words of memory (about 18 MiB at 12 000 blocks) and

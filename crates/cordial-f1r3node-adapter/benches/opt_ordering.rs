@@ -22,7 +22,7 @@ use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_ma
 const WAVELENGTH: u64 = 3;
 const VALIDATOR_COUNT: u8 = 4;
 // Each wave adds WAVELENGTH rounds, each with one block per validator.
-const DEFAULT_HISTORY_WAVES: &[u64] = &[1, 10, 25, 50, 100, 250];
+const DEFAULT_HISTORY_WAVES: &[u64] = &[1, 10, 25, 50, 75, 100];
 
 #[derive(Default)]
 struct BenchAdapter;
