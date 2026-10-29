@@ -204,7 +204,8 @@ def diagnose (config : SlashingConfig) (gamma : Nat)
   if ¬ (config.WellFormed ∧ config.FitsU64) ∨ config.scale < gamma then .invalidConfiguration
   else if ¬ (previous.WellFormed ∧ candidate.WellFormed) then .invalidState
   else if events.round ≠ previous.round + 1 ∨ candidate.round ≠ events.round then .invalidEventRound
-  else if candidate.validatorIds ≠ previous.validatorIds then .invalidValidatorSet
+  else if ¬ previous.validatorIds ⊆ candidate.validatorIds then .invalidValidatorSet
+  else if ¬ ValidPenaltyCandidate previous candidate then .invalidState
   else if maxPenaltyEventCount < events.equivocations.length + events.inactivity.length then .tooManyEvents
   else if ∃ event ∈ events.equivocations, event.evidence = [] then .emptyEvidence
   else if ∃ event ∈ events.equivocations, maxPenaltyEvidenceLength < event.evidence.length then .oversizedEvidence
@@ -274,20 +275,26 @@ theorem failure_no_successor (config : SlashingConfig) (gamma : Nat)
   rw [← transition_iff]
   simp [h]
 
-/-- The complete model conservatively extends #283 on slash-only rounds. -/
+/-- On unchanged identity sets, the complete model conservatively extends
+#283 on slash-only rounds. -/
 theorem transition_noInactivity (config : SlashingConfig) (gamma : Nat)
     (previous candidate successor : PenaltyReputationState)
     (events : PenaltyTransitionEvents context) (ratingParticipants : List NodeId)
     (hReady : ReferencePenaltyReady config gamma previous candidate events ratingParticipants)
-    (hEmpty : events.inactivity = []) :
+    (hEmpty : events.inactivity = [])
+    (hIds : candidate.validatorIds = previous.validatorIds) :
     transition config gamma previous candidate events ratingParticipants = .ok successor ↔
       calculatePenaltyTransition config previous candidate events = .ok successor := by
   rcases hReady with ⟨hStates, hEvents, hEvidence, hBounds, hGamma, hRatings, hArithmetic⟩
+  have hProjected : penaltyValidationCandidate previous candidate = candidate := by
+    simp [penaltyValidationCandidate, ← hIds]
+  have hStaticEvents : ValidPenaltyEvents previous candidate events := by
+    simpa only [hProjected] using hEvents.2.1
   simp [transition, validateTransition,
     show ReferencePenaltyReady config gamma previous candidate events ratingParticipants from
       ⟨hStates, hEvents, hEvidence, hBounds, hGamma, hRatings, hArithmetic⟩,
-    calculatePenaltyTransition, hStates, hEvents, hArithmetic,
-    inactivityPenaltySuccessor_noInactivity config gamma previous candidate events hEmpty,
+    calculatePenaltyTransition, hStates, hStaticEvents, hArithmetic,
+    inactivityPenaltySuccessor_noInactivity config gamma previous candidate events hEmpty hIds,
     Bind.bind, Except.bind, Pure.pure, Except.pure]
 
 /-- Supported inactivity uses exactly the bounded checked arithmetic of #282. -/
@@ -299,7 +306,7 @@ theorem inactivity_checked_refines (config : SlashingConfig) (gamma : Nat)
     checkedRetainedReputation config (previous.account event.offender).activeReputation gamma =
       .ok (retainedReputation config (previous.account event.offender).activeReputation gamma) := by
   rcases hReady with ⟨_, hEvents, _, hBounds, hGamma, _, hArithmetic⟩
-  have hKnown := (List.forall_iff_forall_mem.mp hEvents.2.2.2.2.2 event hEvent).2.1
+  have hKnown := (List.forall_iff_forall_mem.mp hEvents.2.1.2.2.2.2.2 event hEvent).2.1
   have hOld := (hBounds.2.2.2.2 previous (by simp) event.offender hKnown).1
   have hGammaWidth := hGamma.trans hArithmetic.2.1.1
   have hProduct : (previous.account event.offender).activeReputation *
@@ -325,7 +332,7 @@ theorem ready_permutation (config : SlashingConfig) (gamma : Nat)
     (hEq.map (fun (event : AuthorizedEquivocationEvent context) => event.offender)).append
       (hIn.map (fun (event : TransitionInactivityEvent) => event.offender))
   have hSets : first.equivocations.toFinset = second.equivocations.toFinset := List.toFinset_eq_of_perm _ _ hEq
-  simp only [ReferencePenaltyReady, ValidPenaltyEvents, BoundedPenaltyEvidence,
+  simp only [ReferencePenaltyReady, ValidReferencePenaltyEvents, ValidPenaltyEvents, BoundedPenaltyEvidence,
     BoundedPenaltyInputs, List.forall_iff_forall_mem]
   rw [hRound, hAll.nodup_iff, hEq.length_eq, hIn.length_eq, hSets]
   simp only [hEq.mem_iff, hIn.mem_iff]
@@ -396,9 +403,69 @@ theorem transition_permutation_eq (config : SlashingConfig) (gamma : Nat)
 
 theorem successor_excluded_persistent (config : SlashingConfig) (gamma : Nat)
     (previous candidate : PenaltyReputationState) (events : PenaltyTransitionEvents context)
-    (id : NodeId) (hExcluded : (previous.account id).excluded = true) :
+    (id : NodeId) (hKnown : id ∈ previous.validatorIds)
+    (hExcluded : (previous.account id).excluded = true) :
     (inactivityPenaltySuccessor config gamma previous candidate events).account id = previous.account id := by
-  simp [inactivityPenaltySuccessor, hExcluded]
+  simp [inactivityPenaltySuccessor, hKnown, hExcluded]
+
+/-- A newly rated identity is carried from the candidate, independently of
+arbitrary lookup-function values outside the previous registered domain. -/
+theorem successor_newValidator_preserved (config : SlashingConfig) (gamma : Nat)
+    (previous candidate : PenaltyReputationState) (events : PenaltyTransitionEvents context)
+    (id : NodeId) (hCandidate : id ∈ candidate.validatorIds)
+    (hNew : id ∉ previous.validatorIds) :
+    (inactivityPenaltySuccessor config gamma previous candidate events).account id = candidate.account id := by
+  simp only [inactivityPenaltySuccessor, hCandidate, hNew, not_false_eq_true, and_self, ↓reduceIte]
+
+/-- Inactivity changes active reputation only; existing identities retain the
+exclusion flag selected by the shared #283 slashing stage. -/
+theorem successor_existing_exclusion (config : SlashingConfig) (gamma : Nat)
+    (previous candidate : PenaltyReputationState) (events : PenaltyTransitionEvents context)
+    (id : NodeId) (hKnown : id ∈ previous.validatorIds) :
+    ((inactivityPenaltySuccessor config gamma previous candidate events).account id).excluded =
+      ((penaltySuccessor config previous candidate events.round events.equivocations.toFinset).account id).excluded := by
+  by_cases hExcluded : (previous.account id).excluded = true
+  · simp [inactivityPenaltySuccessor, hKnown, hExcluded, penaltySuccessor]
+  · simp only [inactivityPenaltySuccessor, hKnown, not_true_eq_false, and_false,
+      hExcluded, Bool.false_eq_true, ↓reduceIte]
+    split_ifs <;> rfl
+
+/-- Exact provenance of every exclusion: a registered prior exclusion or an
+authorized equivocation event. A well-formed candidate alone is insufficient. -/
+theorem successor_exclusion_iff (config : SlashingConfig) (gamma : Nat)
+    (previous candidate : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context) (ratingParticipants : List NodeId)
+    (hReady : ReferencePenaltyReady config gamma previous candidate events ratingParticipants)
+    (id : NodeId) (hKnown : id ∈ candidate.validatorIds) :
+    ((inactivityPenaltySuccessor config gamma previous candidate events).account id).excluded = true ↔
+      (id ∈ previous.validatorIds ∧ (previous.account id).excluded = true) ∨
+      ∃ event ∈ events.equivocations, event.offender = id := by
+  have hEvents := hReady.2.1
+  by_cases hPrevious : id ∈ previous.validatorIds
+  · rw [successor_existing_exclusion config gamma previous candidate events id hPrevious]
+    by_cases hExcluded : (previous.account id).excluded = true
+    · rw [excluded_persistent config previous candidate events.round events.equivocations.toFinset id hExcluded]
+      simp [hPrevious, hExcluded]
+    · have hActive : (previous.account id).excluded = false := by simpa using hExcluded
+      have hCandidate := hEvents.2.2 id hKnown (Or.inr hActive)
+      by_cases hSlash : ∃ event ∈ events.equivocations, event.offender = id
+      · have hOffender : isEquivocationOffender events.equivocations.toFinset id = true := by
+          simpa only [isEquivocationOffender, decide_eq_true_eq, List.mem_toFinset] using hSlash
+        rw [slash_setsExcluded config previous candidate events.round events.equivocations.toFinset
+          id hActive hOffender]
+        simp only [hSlash, or_true]
+      · have hOffender : isEquivocationOffender events.equivocations.toFinset id = false := by
+          simp only [isEquivocationOffender, List.mem_toFinset, hSlash, decide_false]
+        rw [slash_preserves_nonOffenders config previous candidate events.round events.equivocations.toFinset
+          id hActive hOffender]
+        simp [hCandidate, hExcluded, hSlash]
+  · have hCandidate := hEvents.2.2 id hKnown (Or.inl hPrevious)
+    have hNoSlash : ¬ ∃ event ∈ events.equivocations, event.offender = id := by
+      rintro ⟨event, hEvent, hId⟩
+      have hPrior := (List.forall_iff_forall_mem.mp hEvents.2.1.2.2.2.2.1 event hEvent).2.2.1
+      exact hPrevious (hId ▸ hPrior)
+    rw [successor_newValidator_preserved config gamma previous candidate events id hKnown hPrevious]
+    simp [hCandidate, hPrevious, hNoSlash]
 
 theorem successor_wellFormed (config : SlashingConfig) (gamma : Nat)
     (previous candidate : PenaltyReputationState)
@@ -406,30 +473,43 @@ theorem successor_wellFormed (config : SlashingConfig) (gamma : Nat)
     (hReady : ReferencePenaltyReady config gamma previous candidate events ratingParticipants) :
     (inactivityPenaltySuccessor config gamma previous candidate events).WellFormed := by
   rcases hReady with ⟨hStates, hEvents, _, _, _, hInactivity, _⟩
-  have hSlashed := penaltySuccessor_wellFormed config previous candidate events.round
-    events.equivocations.toFinset hStates.1 hStates.2 hEvents.2.2.1
-  refine ⟨hSlashed.1, ?_⟩
+  have hProjected : (penaltyValidationCandidate previous candidate).WellFormed := by
+    refine ⟨hStates.1.1, ?_⟩
+    intro id hKnown
+    exact hStates.2.2 id (hEvents.1 hKnown)
+  have hSlashed := penaltySuccessor_wellFormed config previous
+    (penaltyValidationCandidate previous candidate) events.round
+    events.equivocations.toFinset hStates.1 hProjected rfl
+  refine ⟨hStates.2.1, ?_⟩
   intro id hKnown
-  change id ∈ previous.validatorIds at hKnown
-  by_cases hExcluded : (previous.account id).excluded = true
-  · simpa only [inactivityPenaltySuccessor, hExcluded, ↓reduceIte] using hStates.1.2 id hKnown
-  · by_cases hInactive : id ∈ events.inactivity.map (·.offender)
-    · obtain ⟨event, hEvent, hId⟩ := List.mem_map.mp hInactive
-      have hCandidate : (candidate.account id).excluded = false := by
-        simpa only [hId] using (hInactivity event hEvent).2
-      have hDisjoint := (List.nodup_append.mp hEvents.2.2.2.1).2.2
-      have hNoSlash : ¬ ∃ event ∈ events.equivocations.toFinset, event.offender = id := by
-        rintro ⟨slash, hSlash, hSlashId⟩
-        exact hDisjoint id (List.mem_map.mpr ⟨slash, List.mem_toFinset.mp hSlash, hSlashId⟩)
-          id hInactive rfl
-      have hOffender : isEquivocationOffender events.equivocations.toFinset id = false := by
-        simp only [isEquivocationOffender, hNoSlash, decide_false]
-      have hCandidateRetained := (hStates.2.2 id (by simpa [hEvents.2.2.1] using hKnown)).2 hCandidate
-      simp only [inactivityPenaltySuccessor, hExcluded, hInactive, penaltySuccessor, hOffender,
-        Bool.false_eq_true, ↓reduceIte, hCandidate, hCandidateRetained]
-      simp
-    · simpa only [inactivityPenaltySuccessor, hExcluded, hInactive, Bool.false_eq_true, ↓reduceIte] using
-        hSlashed.2 id hKnown
+  change id ∈ candidate.validatorIds at hKnown
+  by_cases hPrevious : id ∈ previous.validatorIds
+  · have hNotNew : ¬ (id ∈ candidate.validatorIds ∧ id ∉ previous.validatorIds) := by
+      simp only [hPrevious, not_true_eq_false, and_false, not_false_eq_true]
+    by_cases hExcluded : (previous.account id).excluded = true
+    · simpa only [inactivityPenaltySuccessor, hNotNew, hExcluded, ↓reduceIte] using
+        hStates.1.2 id hPrevious
+    · by_cases hInactive : id ∈ events.inactivity.map (·.offender)
+      · obtain ⟨event, hEvent, hId⟩ := List.mem_map.mp hInactive
+        have hCandidate : (candidate.account id).excluded = false := by
+          simpa only [hId] using (hInactivity event hEvent).2
+        have hDisjoint := (List.nodup_append.mp hEvents.2.1.2.2.2.1).2.2
+        have hNoSlash : ¬ ∃ event ∈ events.equivocations.toFinset, event.offender = id := by
+          rintro ⟨slash, hSlash, hSlashId⟩
+          exact hDisjoint id (List.mem_map.mpr ⟨slash, List.mem_toFinset.mp hSlash, hSlashId⟩)
+            id hInactive rfl
+        have hOffender : isEquivocationOffender events.equivocations.toFinset id = false := by
+          simp only [isEquivocationOffender, hNoSlash, decide_false]
+        have hCandidateRetained := (hStates.2.2 id hKnown).2 hCandidate
+        simp only [inactivityPenaltySuccessor, hNotNew, hExcluded, hInactive,
+          penaltySuccessor, hOffender, Bool.false_eq_true, ↓reduceIte,
+          hCandidate, hCandidateRetained]
+        simp
+      · simpa only [inactivityPenaltySuccessor, hNotNew, hExcluded, hInactive,
+          Bool.false_eq_true, ↓reduceIte, penaltySuccessor, penaltyValidationCandidate] using
+          hSlashed.2 id hPrevious
+  · simpa only [inactivityPenaltySuccessor, hKnown, hPrevious, not_false_eq_true,
+      and_self, ↓reduceIte] using hStates.2.2 id hKnown
 
 theorem transition_ok_wellFormed (config : SlashingConfig) (gamma : Nat)
     (previous candidate successor : PenaltyReputationState)
@@ -439,6 +519,45 @@ theorem transition_ok_wellFormed (config : SlashingConfig) (gamma : Nat)
   obtain ⟨hReady, rfl⟩ := (referencePenaltyTransition_iff _ _ _ _ _ _ _).mp
     ((transition_iff _ _ _ _ _ _ _).mp h)
   exact successor_wellFormed config gamma previous candidate events ratingParticipants hReady
+
+/-- The executable transition exposes the same complete exclusion provenance
+as the relational successor, including on rounds registering new identities. -/
+theorem transition_exclusion_iff (config : SlashingConfig) (gamma : Nat)
+    (previous candidate successor : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context) (ratingParticipants : List NodeId)
+    (h : transition config gamma previous candidate events ratingParticipants = .ok successor)
+    (id : NodeId) (hKnown : id ∈ successor.validatorIds) :
+    (successor.account id).excluded = true ↔
+      (id ∈ previous.validatorIds ∧ (previous.account id).excluded = true) ∨
+      ∃ event ∈ events.equivocations, event.offender = id := by
+  obtain ⟨hReady, rfl⟩ := (referencePenaltyTransition_iff _ _ _ _ _ _ _).mp
+    ((transition_iff _ _ _ _ _ _ _).mp h)
+  exact successor_exclusion_iff config gamma previous candidate events ratingParticipants hReady id hKnown
+
+theorem transition_preserves_previousIds (config : SlashingConfig) (gamma : Nat)
+    (previous candidate successor : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context) (ratingParticipants : List NodeId)
+    (h : transition config gamma previous candidate events ratingParticipants = .ok successor) :
+    previous.validatorIds ⊆ successor.validatorIds := by
+  have hRelation := (transition_iff _ _ _ _ _ _ _).mp h
+  rw [hRelation.identities]
+  exact hRelation.ready.2.1.1
+
+theorem newExclusion_requires_event (config : SlashingConfig) (gamma : Nat)
+    (previous candidate successor : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context) (ratingParticipants : List NodeId)
+    (h : transition config gamma previous candidate events ratingParticipants = .ok successor)
+    (id : NodeId) (hKnown : id ∈ successor.validatorIds)
+    (hNew : id ∉ previous.validatorIds ∨ (previous.account id).excluded = false)
+    (hExcluded : (successor.account id).excluded = true) :
+    ∃ event ∈ events.equivocations, event.offender = id := by
+  rcases (transition_exclusion_iff config gamma previous candidate successor events
+    ratingParticipants h id hKnown).mp hExcluded with hPrior | hEvent
+  · rcases hNew with hUnknown | hActive
+    · exact False.elim (hUnknown hPrior.1)
+    · rw [hActive] at hPrior
+      cases hPrior.2
+  · exact hEvent
 
 /-- Finite exported-weight view for conformance fixtures. Unknown requested
 identities and excluded keys both project to zero, per the formal definition. -/

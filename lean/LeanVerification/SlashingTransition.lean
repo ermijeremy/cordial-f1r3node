@@ -676,15 +676,55 @@ instance (previous candidate : PenaltyReputationState)
   unfold BoundedPenaltyInputs
   infer_instance
 
+/-- Apply #283's event checks to the previous identity domain. The full
+candidate is independently validated; this projection only removes the old
+static-set requirement from event validation. -/
+def penaltyValidationCandidate (previous candidate : PenaltyReputationState) :
+    PenaltyReputationState :=
+  { candidate with validatorIds := previous.validatorIds }
+
+/-- A blend/clamp candidate cannot eject a new or previously active key.
+Prior exclusions are restored by the successor even if the candidate omits
+their flags, matching audited Rust replay. Unknown account-function values
+outside the previous identity domain establish no exclusion provenance. -/
+def ValidPenaltyCandidate (previous candidate : PenaltyReputationState) : Prop :=
+  ∀ id ∈ candidate.validatorIds,
+    (id ∉ previous.validatorIds ∨ (previous.account id).excluded = false) →
+      (candidate.account id).excluded = false
+
+instance (previous candidate : PenaltyReputationState) :
+    Decidable (ValidPenaltyCandidate previous candidate) := by
+  unfold ValidPenaltyCandidate
+  infer_instance
+
+/-- Blend may grow the identity domain, but cannot remove old keys or invent
+an exclusion before the penalty stage. Penalty offenders must still be known
+in the previous snapshot, as required by Rust's prior-entry lookup. -/
+def ValidReferencePenaltyEvents (previous candidate : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context) : Prop :=
+  previous.validatorIds ⊆ candidate.validatorIds ∧
+    ValidPenaltyEvents previous (penaltyValidationCandidate previous candidate) events ∧
+    ValidPenaltyCandidate previous candidate
+
+instance (previous candidate : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context) :
+    Decidable (ValidReferencePenaltyEvents previous candidate events) := by
+  unfold ValidReferencePenaltyEvents
+  infer_instance
+
 /-- One missed round consumes previous reputation, not the blended candidate.
-Prior exclusion takes priority even for malformed event sets. -/
+New candidate identities retain their candidate account and do not contribute
+to previous-round correlation. Prior registered exclusions take priority. -/
 def inactivityPenaltySuccessor (config : SlashingConfig) (gamma : Nat)
     (previous candidate : PenaltyReputationState)
     (events : PenaltyTransitionEvents context) : PenaltyReputationState :=
   let slashed := penaltySuccessor config previous candidate events.round
     events.equivocations.toFinset
-  { slashed with account := fun id =>
-      if (previous.account id).excluded then previous.account id
+  { slashed with
+    validatorIds := candidate.validatorIds
+    account := fun id =>
+      if id ∈ candidate.validatorIds ∧ id ∉ previous.validatorIds then candidate.account id
+      else if (previous.account id).excluded then previous.account id
       else if id ∈ events.inactivity.map (·.offender) then
         { slashed.account id with
           activeReputation := retainedReputation config (previous.account id).activeReputation gamma }
@@ -697,7 +737,7 @@ def ReferencePenaltyReady (config : SlashingConfig) (gamma : Nat)
     (previous candidate : PenaltyReputationState)
     (events : PenaltyTransitionEvents context) (ratingParticipants : List NodeId) : Prop :=
   (previous.WellFormed ∧ candidate.WellFormed) ∧
-    ValidPenaltyEvents previous candidate events ∧
+    ValidReferencePenaltyEvents previous candidate events ∧
     BoundedPenaltyEvidence events ∧
     BoundedPenaltyInputs previous candidate events ∧
     gamma ≤ config.scale ∧
@@ -721,7 +761,7 @@ structure ReferencePenaltyTransition (config : SlashingConfig) (gamma : Nat)
     (successor : PenaltyReputationState) : Prop where
   ready : ReferencePenaltyReady config gamma previous candidate events ratingParticipants
   round : successor.round = events.round
-  identities : successor.validatorIds = previous.validatorIds
+  identities : successor.validatorIds = candidate.validatorIds
   accounts : ∀ id, successor.account id =
     (inactivityPenaltySuccessor config gamma previous candidate events).account id
 
@@ -742,10 +782,12 @@ theorem referencePenaltyTransition_iff (config : SlashingConfig) (gamma : Nat)
 
 theorem inactivityPenaltySuccessor_noInactivity (config : SlashingConfig) (gamma : Nat)
     (previous candidate : PenaltyReputationState)
-    (events : PenaltyTransitionEvents context) (hEmpty : events.inactivity = []) :
+    (events : PenaltyTransitionEvents context) (hEmpty : events.inactivity = [])
+    (hIds : candidate.validatorIds = previous.validatorIds) :
     inactivityPenaltySuccessor config gamma previous candidate events =
       penaltySuccessor config previous candidate events.round events.equivocations.toFinset := by
-  simp only [inactivityPenaltySuccessor, hEmpty, List.map_nil, List.not_mem_nil, ↓reduceIte]
+  simp only [inactivityPenaltySuccessor, hEmpty, List.map_nil, List.not_mem_nil,
+    hIds, and_not_self, ↓reduceIte]
   congr 1
   funext id
   by_cases hExcluded : (previous.account id).excluded = true <;>
