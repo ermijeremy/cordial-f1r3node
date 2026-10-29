@@ -5,6 +5,12 @@ formalizes the state-changing boundary that applies authorized equivocation
 events to a Proof-of-Reputation snapshot. The model is in
 `lean/LeanVerification/SlashingTransition.lean`.
 
+The original #283 transition primitives below model a fixed identity domain and
+assume an admissible pre-penalty candidate. The [#284 reference](10-executable-slashing-reference.md)
+extends the shared contract to candidate-set growth and explicitly validates
+candidate exclusion provenance. Use `SlashingRef.transition` for conformance
+admission, including rounds that add newly rated validators.
+
 ## Model
 
 `ValidatorReputation` records active reputation, retained reputation, and the
