@@ -11,6 +11,8 @@ import LeanVerification.Slashing
 import LeanVerification.SlashingArithmetic
 import LeanVerification.SlashingTransition
 import LeanVerification.SlashingTransitionExamples
+import LeanVerification.SlashingRef
+import LeanVerification.SlashingRefExamples
 import LeanVerification.Approval
 import LeanVerification.Finality
 import LeanVerification.Ordering

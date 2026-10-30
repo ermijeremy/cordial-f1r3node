@@ -638,4 +638,159 @@ theorem eventPermutation_invariant
     exact hPermutation.mem_iff
   rw [hSets]
 
+/-! ## Complete bounded reference-transition contract (#284)
+
+The earlier slashing theorems deliberately leave inactivity decay outside
+their scope. This extension specifies that stage using the same floor-divided
+arithmetic, without changing the meaning of `penaltySuccessor`.
+-/
+
+/-- Rust's per-evidence byte limit and event-count limit. Wire encoding and
+byte-valued node identities are outside this Nat-identity model. -/
+def maxPenaltyEvidenceLength : Nat := 64 * 1024
+def maxPenaltyEventCount : Nat := 1_000_000
+
+def BoundedPenaltyEvidence (events : PenaltyTransitionEvents context) : Prop :=
+  events.equivocations.length + events.inactivity.length ≤ maxPenaltyEventCount ∧
+    ∀ event ∈ events.equivocations, event.evidence.length ≤ maxPenaltyEvidenceLength
+
+instance (events : PenaltyTransitionEvents context) :
+    Decidable (BoundedPenaltyEvidence events) := by
+  unfold BoundedPenaltyEvidence
+  infer_instance
+
+/-- Width checks on finite input fields not already covered by the checked
+slash arithmetic. Unknown account-function values are never serialized. -/
+def BoundedPenaltyInputs (previous candidate : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context) : Prop :=
+  previous.round ≤ u64Max ∧ candidate.round ≤ u64Max ∧ events.round ≤ u64Max ∧
+    (∀ event ∈ events.equivocations,
+      event.offenseRound ≤ u64Max ∧ event.applicationRound ≤ u64Max) ∧
+    (∀ state ∈ [previous, candidate], ∀ id ∈ state.validatorIds,
+      (state.account id).activeReputation ≤ u64Max ∧
+      (state.account id).retainedReputation ≤ u64Max)
+
+instance (previous candidate : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context) :
+    Decidable (BoundedPenaltyInputs previous candidate events) := by
+  unfold BoundedPenaltyInputs
+  infer_instance
+
+/-- Apply #283's event checks to the previous identity domain. The full
+candidate is independently validated; this projection only removes the old
+static-set requirement from event validation. -/
+def penaltyValidationCandidate (previous candidate : PenaltyReputationState) :
+    PenaltyReputationState :=
+  { candidate with validatorIds := previous.validatorIds }
+
+/-- A blend/clamp candidate cannot eject a new or previously active key.
+Prior exclusions are restored by the successor even if the candidate omits
+their flags, matching audited Rust replay. Unknown account-function values
+outside the previous identity domain establish no exclusion provenance. -/
+def ValidPenaltyCandidate (previous candidate : PenaltyReputationState) : Prop :=
+  ∀ id ∈ candidate.validatorIds,
+    (id ∉ previous.validatorIds ∨ (previous.account id).excluded = false) →
+      (candidate.account id).excluded = false
+
+instance (previous candidate : PenaltyReputationState) :
+    Decidable (ValidPenaltyCandidate previous candidate) := by
+  unfold ValidPenaltyCandidate
+  infer_instance
+
+/-- Blend may grow the identity domain, but cannot remove old keys or invent
+an exclusion before the penalty stage. Penalty offenders must still be known
+in the previous snapshot, as required by Rust's prior-entry lookup. -/
+def ValidReferencePenaltyEvents (previous candidate : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context) : Prop :=
+  previous.validatorIds ⊆ candidate.validatorIds ∧
+    ValidPenaltyEvents previous (penaltyValidationCandidate previous candidate) events ∧
+    ValidPenaltyCandidate previous candidate
+
+instance (previous candidate : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context) :
+    Decidable (ValidReferencePenaltyEvents previous candidate events) := by
+  unfold ValidReferencePenaltyEvents
+  infer_instance
+
+/-- One missed round consumes previous reputation, not the blended candidate.
+New candidate identities retain their candidate account and do not contribute
+to previous-round correlation. Prior registered exclusions take priority. -/
+def inactivityPenaltySuccessor (config : SlashingConfig) (gamma : Nat)
+    (previous candidate : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context) : PenaltyReputationState :=
+  let slashed := penaltySuccessor config previous candidate events.round
+    events.equivocations.toFinset
+  { slashed with
+    validatorIds := candidate.validatorIds
+    account := fun id =>
+      if id ∈ candidate.validatorIds ∧ id ∉ previous.validatorIds then candidate.account id
+      else if (previous.account id).excluded then previous.account id
+      else if id ∈ events.inactivity.map (·.offender) then
+        { slashed.account id with
+          activeReputation := retainedReputation config (previous.account id).activeReputation gamma }
+      else slashed.account id }
+
+/-- Complete admission contract. `ratingParticipants` is the explicit input
+for Rust's rule forbidding an inactive offender from rating or being rated.
+Finalized inactivity decisions remain a host input, as in #283. -/
+def ReferencePenaltyReady (config : SlashingConfig) (gamma : Nat)
+    (previous candidate : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context) (ratingParticipants : List NodeId) : Prop :=
+  (previous.WellFormed ∧ candidate.WellFormed) ∧
+    ValidReferencePenaltyEvents previous candidate events ∧
+    BoundedPenaltyEvidence events ∧
+    BoundedPenaltyInputs previous candidate events ∧
+    gamma ≤ config.scale ∧
+    (∀ event ∈ events.inactivity,
+      event.offender ∉ ratingParticipants ∧ (candidate.account event.offender).excluded = false) ∧
+    PenaltyArithmeticReady config previous events.equivocations.toFinset
+
+instance (config : SlashingConfig) (gamma : Nat)
+    (previous candidate : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context) (ratingParticipants : List NodeId) :
+    Decidable (ReferencePenaltyReady config gamma previous candidate events ratingParticipants) := by
+  unfold ReferencePenaltyReady
+  infer_instance
+
+/-- Relational successor: admission plus complete state equality, expressed
+fieldwise so a caller need not assume equality of account functions. This
+contract mentions no executable reference checker. -/
+structure ReferencePenaltyTransition (config : SlashingConfig) (gamma : Nat)
+    (previous candidate : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context) (ratingParticipants : List NodeId)
+    (successor : PenaltyReputationState) : Prop where
+  ready : ReferencePenaltyReady config gamma previous candidate events ratingParticipants
+  round : successor.round = events.round
+  identities : successor.validatorIds = candidate.validatorIds
+  accounts : ∀ id, successor.account id =
+    (inactivityPenaltySuccessor config gamma previous candidate events).account id
+
+theorem referencePenaltyTransition_iff (config : SlashingConfig) (gamma : Nat)
+    (previous candidate successor : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context) (ratingParticipants : List NodeId) :
+    ReferencePenaltyTransition config gamma previous candidate events ratingParticipants successor ↔
+      ReferencePenaltyReady config gamma previous candidate events ratingParticipants ∧
+      inactivityPenaltySuccessor config gamma previous candidate events = successor := by
+  constructor
+  · intro h
+    refine ⟨h.ready, ?_⟩
+    cases successor
+    simp only [inactivityPenaltySuccessor, penaltySuccessor, PenaltyReputationState.mk.injEq]
+    exact ⟨h.round.symm, h.identities.symm, (funext h.accounts).symm⟩
+  · rintro ⟨hReady, rfl⟩
+    exact ⟨hReady, rfl, rfl, fun _ => rfl⟩
+
+theorem inactivityPenaltySuccessor_noInactivity (config : SlashingConfig) (gamma : Nat)
+    (previous candidate : PenaltyReputationState)
+    (events : PenaltyTransitionEvents context) (hEmpty : events.inactivity = [])
+    (hIds : candidate.validatorIds = previous.validatorIds) :
+    inactivityPenaltySuccessor config gamma previous candidate events =
+      penaltySuccessor config previous candidate events.round events.equivocations.toFinset := by
+  simp only [inactivityPenaltySuccessor, hEmpty, List.map_nil, List.not_mem_nil,
+    hIds, and_not_self, ↓reduceIte]
+  congr 1
+  funext id
+  by_cases hExcluded : (previous.account id).excluded = true <;>
+    simp [penaltySuccessor, hExcluded]
+
 end CordialMiners
